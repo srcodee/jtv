@@ -157,7 +157,11 @@ func closestField(target string, fields []string) string {
 		if field == "raw" {
 			continue
 		}
-		distance := levenshtein(target, strings.ToLower(field))
+		candidate := strings.ToLower(field)
+		if fieldBaseName(candidate) == target {
+			return field
+		}
+		distance := levenshtein(target, candidate)
 		limit := max(2, len(target)/3)
 		if distance > limit {
 			continue
@@ -168,6 +172,11 @@ func closestField(target string, fields []string) string {
 		}
 	}
 	return bestField
+}
+
+func fieldBaseName(field string) string {
+	parts := strings.Split(field, ".")
+	return parts[len(parts)-1]
 }
 
 func levenshtein(a, b string) int {

@@ -69,6 +69,9 @@ CSV; `.json` writes JSON.
 `--csv` and `--json` override the configured default output format for a single
 command.
 
+`-q` also accepts `ls`, `schema`, `.schema`, and `preview [N]` for quick
+non-interactive inspection.
+
 ## Input
 
 JSON input can be an array, object, scalar, or NDJSON stream:

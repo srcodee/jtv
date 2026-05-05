@@ -247,6 +247,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runInteractive(ds, stdin, stdout, opts.pageSize)
 	}
 
+	if handled, err := runQueryCommand(ds, stdout, opts.query); handled {
+		return err
+	}
+
 	result, err := ds.Query(context.Background(), opts.query)
 	if err != nil {
 		return err
@@ -262,6 +266,28 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 	printTable(stdout, result)
 	return nil
+}
+
+func runQueryCommand(ds *Dataset, out io.Writer, query string) (bool, error) {
+	command, arg := splitCommand(strings.TrimSpace(query))
+	switch command {
+	case "ls", "schema", ".ls", ".schema":
+		printSchema(out, ds.Fields, ds.FieldLabels, arg)
+		return true, nil
+	case "preview", ".preview":
+		limit := "10"
+		if arg != "" {
+			limit = arg
+		}
+		result, err := ds.Query(context.Background(), "select * limit "+limit)
+		if err != nil {
+			return true, err
+		}
+		printTable(out, result)
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 func printVersion(out io.Writer) {

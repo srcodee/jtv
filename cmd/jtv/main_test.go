@@ -219,6 +219,48 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
+func TestRunQueryCommandSchema(t *testing.T) {
+	stdin := strings.NewReader(`[{"id":1,"user":{"name":"Ana"}}]`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "-q", "ls"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "user.name") {
+		t.Fatalf("stdout = %q, want user.name field", stdout.String())
+	}
+}
+
+func TestRunQueryCommandDotSchema(t *testing.T) {
+	stdin := strings.NewReader(`[{"id":1,"user":{"name":"Ana"}}]`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "-q", ".schema"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "user.name") {
+		t.Fatalf("stdout = %q, want user.name field", stdout.String())
+	}
+}
+
+func TestRunQueryCommandPreview(t *testing.T) {
+	stdin := strings.NewReader(`[{"id":1},{"id":2}]`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "-q", "preview 1"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "1 row(s)") {
+		t.Fatalf("stdout = %q, want one preview row", stdout.String())
+	}
+}
+
 func TestReadmeSampleCommands(t *testing.T) {
 	commands := []string{
 		`./jtv -f examples/users.json -q "select id, user.name, status"`,
