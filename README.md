@@ -300,7 +300,8 @@ jtv_stream_stop
 Data tools accept `data`, `file_path`, or `url`. URL input also accepts optional
 `method`, `headers`, `body`, and `body_file` arguments for requests that need
 POST, PUT, PATCH, DELETE, cookies, bearer tokens, CSRF tokens, or request
-payloads. Use `url` in MCP when you would normally run `curl URL | jtv` in the
+payloads. MCP URL input is fetched through `curl` and requires `curl` to be on
+`PATH`. Use `url` in MCP when you would normally run `curl URL | jtv` in the
 CLI. `jtv_query` also requires `query`.
 
 Example `tools/call` request:

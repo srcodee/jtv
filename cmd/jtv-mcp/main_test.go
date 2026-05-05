@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,21 +61,23 @@ func TestMCPQueryTool(t *testing.T) {
 }
 
 func TestMCPQueryToolURL(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-CSRF-Token") != "token-123" {
-			http.Error(w, "missing csrf", http.StatusForbidden)
-			return
-		}
-		if r.Header.Get("Cookie") != "session=abc" {
-			http.Error(w, "missing cookie", http.StatusForbidden)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"id":1,"name":"Ana","score":90},{"id":2,"name":"Budi","score":75}]`))
-	}))
-	defer srv.Close()
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "curl-args.txt")
+	bodyPath := filepath.Join(dir, "curl-body.txt")
+	fakeCurl := filepath.Join(dir, "curl")
+	if err := os.WriteFile(fakeCurl, []byte(`#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$CURL_ARGS_FILE"
+cat > "$CURL_BODY_FILE"
+printf '%s\n' '[{"id":1,"name":"Ana","score":90},{"id":2,"name":"Budi","score":75}]'
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CURL_ARGS_FILE", argsPath)
+	t.Setenv("CURL_BODY_FILE", bodyPath)
 
-	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"` + srv.URL + `","headers":{"Cookie":"session=abc","X-CSRF-Token":"token-123"},"query":"select name, score order by score desc limit 1"}}}`
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"https://example.test/api/orders","headers":{"Cookie":"session=abc","X-CSRF-Token":"token-123"},"query":"select name, score order by score desc limit 1"}}}`
 	var out bytes.Buffer
 
 	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
@@ -96,33 +95,40 @@ func TestMCPQueryToolURL(t *testing.T) {
 	if first["name"] != "Ana" || first["score"] != float64(90) {
 		t.Fatalf("first object = %#v, want Ana score 90", first)
 	}
+
+	rawArgs, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(rawArgs)), "\n")
+	if !containsAll(args, "-sS", "--fail", "-X", "GET", "-H", "Cookie: session=abc", "-H", "X-CSRF-Token: token-123", "https://example.test/api/orders") {
+		t.Fatalf("curl args = %#v, want method, headers, and url", args)
+	}
+	if rawBody, err := os.ReadFile(bodyPath); err != nil {
+		t.Fatal(err)
+	} else if len(rawBody) != 0 {
+		t.Fatalf("curl body = %q, want empty", string(rawBody))
+	}
 }
 
 func TestMCPQueryToolURLMethodAndBody(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "wrong method", http.StatusMethodNotAllowed)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer secret" {
-			http.Error(w, "missing authorization", http.StatusForbidden)
-			return
-		}
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if string(raw) != `{"active":true}` {
-			http.Error(w, "wrong body", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"id":1,"status":"ok"}]`))
-	}))
-	defer srv.Close()
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "curl-args.txt")
+	bodyPath := filepath.Join(dir, "curl-body.txt")
+	fakeCurl := filepath.Join(dir, "curl")
+	if err := os.WriteFile(fakeCurl, []byte(`#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$CURL_ARGS_FILE"
+cat > "$CURL_BODY_FILE"
+printf '%s\n' '[{"id":1,"status":"ok"}]'
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CURL_ARGS_FILE", argsPath)
+	t.Setenv("CURL_BODY_FILE", bodyPath)
 
-	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"` + srv.URL + `","method":"POST","headers":{"Authorization":"Bearer secret","Content-Type":"application/json"},"body":"{\"active\":true}","query":"select id, status"}}}`
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"https://example.test/api/search","method":"POST","headers":{"Authorization":"Bearer secret","Content-Type":"application/json"},"body":"{\"active\":true}","query":"select id, status"}}}`
 	var out bytes.Buffer
 
 	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
@@ -139,6 +145,44 @@ func TestMCPQueryToolURLMethodAndBody(t *testing.T) {
 	first := objects[0].(map[string]any)
 	if first["status"] != "ok" {
 		t.Fatalf("first object = %#v, want status ok", first)
+	}
+
+	rawArgs, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(rawArgs)), "\n")
+	if !containsAll(args, "-sS", "--fail", "-X", "POST", "-H", "Authorization: Bearer secret", "-H", "Content-Type: application/json", "--data-binary", "@-", "https://example.test/api/search") {
+		t.Fatalf("curl args = %#v, want POST, headers, data, and url", args)
+	}
+	rawBody, err := os.ReadFile(bodyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rawBody) != `{"active":true}` {
+		t.Fatalf("curl body = %q, want JSON payload", string(rawBody))
+	}
+}
+
+func TestMCPQueryToolURLMissingCurl(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"https://example.test/api/orders","query":"select *"}}}`
+	var out bytes.Buffer
+
+	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := decodeResponses(t, out.String())
+	result := responses[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("tool result = %#v, want error", result)
+	}
+	content := result["content"].([]any)
+	first := content[0].(map[string]any)
+	if !strings.Contains(first["text"].(string), "curl") {
+		t.Fatalf("error text = %q, want curl mention", first["text"])
 	}
 }
 
@@ -319,4 +363,18 @@ func containsAny(values []any, want string) bool {
 		}
 	}
 	return false
+}
+
+func containsAll(values []string, wants ...string) bool {
+	have := map[string]int{}
+	for _, value := range values {
+		have[value]++
+	}
+	for _, want := range wants {
+		if have[want] == 0 {
+			return false
+		}
+		have[want]--
+	}
+	return true
 }

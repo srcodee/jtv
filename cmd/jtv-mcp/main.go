@@ -2,14 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -306,7 +307,7 @@ func (s *server) callTool(ctx context.Context, params json.RawMessage) toolResul
 }
 
 func handleQuery(ctx context.Context, args map[string]any) (toolResult, error) {
-	ds, err := datasetFromArgs(args)
+	ds, err := datasetFromArgs(ctx, args)
 	if err != nil {
 		return toolResult{}, err
 	}
@@ -325,8 +326,7 @@ func handleQuery(ctx context.Context, args map[string]any) (toolResult, error) {
 }
 
 func handleSchema(ctx context.Context, args map[string]any) (toolResult, error) {
-	_ = ctx
-	ds, err := datasetFromArgs(args)
+	ds, err := datasetFromArgs(ctx, args)
 	if err != nil {
 		return toolResult{}, err
 	}
@@ -351,7 +351,7 @@ func handleSchema(ctx context.Context, args map[string]any) (toolResult, error) 
 }
 
 func handlePreview(ctx context.Context, args map[string]any) (toolResult, error) {
-	ds, err := datasetFromArgs(args)
+	ds, err := datasetFromArgs(ctx, args)
 	if err != nil {
 		return toolResult{}, err
 	}
@@ -373,7 +373,7 @@ func handleStreamQuery(ctx context.Context, args map[string]any) (toolResult, er
 	if query == "" {
 		return toolResult{}, errors.New("query is required")
 	}
-	data, source, err := inputDataFromArgs(args)
+	data, source, err := inputDataFromArgs(ctx, args)
 	if err != nil {
 		return toolResult{}, err
 	}
@@ -410,7 +410,7 @@ func handleStreamQuery(ctx context.Context, args map[string]any) (toolResult, er
 }
 
 func handleExport(ctx context.Context, args map[string]any) (toolResult, error) {
-	ds, err := datasetFromArgs(args)
+	ds, err := datasetFromArgs(ctx, args)
 	if err != nil {
 		return toolResult{}, err
 	}
@@ -570,15 +570,15 @@ func queryStreamLine(ctx context.Context, line []byte, query, source string, lin
 	return event
 }
 
-func datasetFromArgs(args map[string]any) (*jtvcore.Dataset, error) {
-	data, source, err := inputDataFromArgs(args)
+func datasetFromArgs(ctx context.Context, args map[string]any) (*jtvcore.Dataset, error) {
+	data, source, err := inputDataFromArgs(ctx, args)
 	if err != nil {
 		return nil, err
 	}
 	return jtvcore.NewDataset([]byte(data), source)
 }
 
-func inputDataFromArgs(args map[string]any) (string, string, error) {
+func inputDataFromArgs(ctx context.Context, args map[string]any) (string, string, error) {
 	data := stringArg(args, "data")
 	if data != "" {
 		return data, "inline", nil
@@ -593,7 +593,7 @@ func inputDataFromArgs(args map[string]any) (string, string, error) {
 	}
 	inputURL := stringArg(args, "url")
 	if inputURL != "" {
-		raw, err := readURLInput(inputURL, args)
+		raw, err := readURLInput(ctx, inputURL, args)
 		if err != nil {
 			return "", "", err
 		}
@@ -602,7 +602,7 @@ func inputDataFromArgs(args map[string]any) (string, string, error) {
 	return "", "", errors.New("data, file_path, or url is required")
 }
 
-func readURLInput(rawURL string, args map[string]any) ([]byte, error) {
+func readURLInput(ctx context.Context, rawURL string, args map[string]any) ([]byte, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -612,55 +612,63 @@ func readURLInput(rawURL string, args map[string]any) ([]byte, error) {
 	}
 	method := strings.ToUpper(strings.TrimSpace(stringArg(args, "method")))
 	if method == "" {
-		method = http.MethodGet
+		method = "GET"
 	}
-	body, err := requestBodyFromArgs(args)
+	body, hasBody, err := requestBodyFromArgs(args)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(method, rawURL, body)
-	if err != nil {
-		return nil, err
-	}
+	curlArgs := []string{"-sS", "--fail", "-X", method}
 	for key, value := range stringMapArg(args, "headers") {
-		req.Header.Set(key, value)
+		curlArgs = append(curlArgs, "-H", key+": "+value)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
+	if hasBody {
+		curlArgs = append(curlArgs, "--data-binary", "@-")
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("url returned HTTP status %s", resp.Status)
+	curlArgs = append(curlArgs, rawURL)
+
+	cmd := exec.CommandContext(ctx, "curl", curlArgs...)
+	if hasBody {
+		cmd.Stdin = bytes.NewReader(body)
 	}
-	limited := io.LimitReader(resp.Body, maxURLInputBytes+1)
-	raw, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, err
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, errors.New("url input requires curl in PATH")
+		}
+		message := strings.TrimSpace(stderr.String())
+		if message != "" {
+			return nil, fmt.Errorf("curl failed: %s", message)
+		}
+		return nil, fmt.Errorf("curl failed: %w", err)
 	}
+	raw := stdout.Bytes()
 	if len(raw) > maxURLInputBytes {
 		return nil, fmt.Errorf("url response exceeds %d bytes", maxURLInputBytes)
 	}
 	return raw, nil
 }
 
-func requestBodyFromArgs(args map[string]any) (io.Reader, error) {
+func requestBodyFromArgs(args map[string]any) ([]byte, bool, error) {
 	body := stringArg(args, "body")
 	bodyFile := stringArg(args, "body_file")
 	if body != "" && bodyFile != "" {
-		return nil, errors.New("body and body_file are mutually exclusive")
+		return nil, false, errors.New("body and body_file are mutually exclusive")
 	}
 	if body != "" {
-		return strings.NewReader(body), nil
+		return []byte(body), true, nil
 	}
 	if bodyFile == "" {
-		return nil, nil
+		return nil, false, nil
 	}
 	raw, err := os.ReadFile(bodyFile)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return strings.NewReader(string(raw)), nil
+	return raw, true, nil
 }
 
 func resultPayload(result *jtvcore.QueryResult) map[string]any {
