@@ -1,4 +1,4 @@
-module github.com/srcodee/jtc
+module github.com/srcodee/jtv
 
 go 1.24
 

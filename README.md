@@ -14,7 +14,7 @@ The table name is optional. `select *` automatically means
 ## Install
 
 ```bash
-go install github.com/srcodee/jtc/cmd/jtv@latest
+go install github.com/srcodee/jtv/cmd/jtv@latest
 ```
 
 ## Build
