@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "user": {
+      "name": "Ana",
+      "active": true
+    },
+    "status": "ok"
+  },
+  {
+    "id": 2,
+    "user": {
+      "name": "Budi",
+      "active": false
+    },
+    "status": "ok"
+  },
+  {
+    "id": 3,
+    "user": {
+      "name": "Ana",
+      "active": true
+    },
+    "status": "fail"
+  }
+]

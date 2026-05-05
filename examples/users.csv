@@ -1,0 +1,4 @@
+id,status,user.name,user.active
+1,ok,Ana,1
+2,ok,Budi,0
+3,fail,Ana,1
