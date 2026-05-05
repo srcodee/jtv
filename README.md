@@ -39,6 +39,7 @@ tail -f ok.txt | ./jtv --stream -q "select time, status, duration_s, db_count"
 ./jtv -f data.json -q "select user.name, order.total" --json
 ./jtv -f data.json -q "select user.name, order.total" -o result.csv
 ./jtv -f data.json -q "select user.name, order.total" -o result.json
+./jtv --version
 ```
 
 Use `-f` for files. Piped stdin is detected automatically, so `curl ... | ./jtv`
@@ -55,6 +56,7 @@ Without `-q`, `jtv` starts an interactive prompt with SQL autocomplete.
 --csv       write query output as CSV
 --json      write query output as pretty JSON
 --stream    read NDJSON continuously and run -q for each line
+--version   print version and exit
 -config FILE
             read defaults from FILE instead of the user config path
 --no-config ignore config file

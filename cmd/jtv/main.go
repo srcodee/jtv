@@ -21,6 +21,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const version = "0.1.0"
+
 type options struct {
 	file       string
 	query      string
@@ -31,6 +33,7 @@ type options struct {
 	stream     bool
 	noConfig   bool
 	configSet  bool
+	version    bool
 	pageSize   int
 }
 
@@ -214,10 +217,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs.BoolVar(&opts.json, "json", opts.json, "write query result as JSON")
 	fs.BoolVar(&opts.stream, "stream", false, "read NDJSON continuously and run query for each line")
 	fs.BoolVar(&opts.noConfig, "no-config", opts.noConfig, "ignore config file")
+	fs.BoolVar(&opts.version, "version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	resolveOutputFlagOverrides(fs, &opts)
+
+	if opts.version {
+		printVersion(stdout)
+		return nil
+	}
 
 	if opts.stream {
 		return runStream(fs.Args(), stdin, stdout, opts)
@@ -253,6 +262,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 	printTable(stdout, result)
 	return nil
+}
+
+func printVersion(out io.Writer) {
+	fmt.Fprintf(out, "jtv %s\n", version)
 }
 
 func readInput(args []string, stdin io.Reader, file string) ([]byte, string, error) {

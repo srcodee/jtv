@@ -206,6 +206,19 @@ func TestRunOutputFlagOverridesConfig(t *testing.T) {
 	}
 }
 
+func TestRunVersion(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"--version"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if stdout.String() != "jtv 0.1.0\n" {
+		t.Fatalf("stdout = %q, want version", stdout.String())
+	}
+}
+
 func TestReadmeSampleCommands(t *testing.T) {
 	commands := []string{
 		`./jtv -f examples/users.json -q "select id, user.name, status"`,
