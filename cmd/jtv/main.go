@@ -12,7 +12,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -1272,13 +1271,4 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func sortedKeys(m map[string]struct{}) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }

@@ -21,6 +21,7 @@ go install github.com/srcodee/jtv/cmd/jtv@latest
 
 ```bash
 go build -buildvcs=false -o jtv ./cmd/jtv
+go build -buildvcs=false -o jtv-mcp ./cmd/jtv-mcp
 ```
 
 ## Usage
@@ -268,4 +269,30 @@ Explore interactively:
 
 ```bash
 ./jtv -f examples/users.json
+```
+
+## MCP Server
+
+`jtv` also includes an MCP server for AI clients that can call tools over stdio:
+
+```bash
+go build -buildvcs=false -o jtv-mcp ./cmd/jtv-mcp
+./jtv-mcp
+```
+
+Available tools:
+
+```text
+jtv_query    query inline data or a local file with SQL
+jtv_schema   list detected flattened fields
+jtv_preview  preview the first rows
+```
+
+Each tool accepts either `data` or `file_path`. `jtv_query` also requires
+`query`.
+
+Example `tools/call` request:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"file_path":"examples/users.json","query":"select user.name, count(*) as total group by user.name"}}}
 ```

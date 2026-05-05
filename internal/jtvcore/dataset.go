@@ -1,4 +1,4 @@
-package main
+package jtvcore
 
 import (
 	"bytes"
@@ -206,6 +206,29 @@ func levenshtein(a, b string) int {
 		prev, curr = curr, prev
 	}
 	return prev[len(b)]
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (d *Dataset) load(rows []map[string]any) error {
@@ -753,7 +776,7 @@ func hasTopLevelFrom(query string) bool {
 	return hasTopLevelKeyword(query, "from")
 }
 
-func hasTopLevelLimit(query string) bool {
+func HasTopLevelLimit(query string) bool {
 	return hasTopLevelKeyword(query, "limit")
 }
 
