@@ -30,14 +30,16 @@ type options struct {
 	json       bool
 	stream     bool
 	noConfig   bool
+	configSet  bool
 	pageSize   int
 }
 
 func defaultOptions(args []string) (options, error) {
 	opts := options{pageSize: defaultPageSize}
-	configPath, noConfig := configArgs(args)
+	configPath, noConfig, configSet := configArgs(args)
 	opts.configPath = configPath
 	opts.noConfig = noConfig
+	opts.configSet = configSet
 	if noConfig {
 		return opts, nil
 	}
@@ -51,9 +53,10 @@ func defaultOptions(args []string) (options, error) {
 	return applyConfigFile(opts)
 }
 
-func configArgs(args []string) (string, bool) {
+func configArgs(args []string) (string, bool, bool) {
 	var path string
 	noConfig := false
+	configSet := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
@@ -62,15 +65,18 @@ func configArgs(args []string) (string, bool) {
 		case arg == "--config" || arg == "-config":
 			if i+1 < len(args) {
 				path = args[i+1]
+				configSet = true
 				i++
 			}
 		case strings.HasPrefix(arg, "--config="):
 			path = strings.TrimPrefix(arg, "--config=")
+			configSet = true
 		case strings.HasPrefix(arg, "-config="):
 			path = strings.TrimPrefix(arg, "-config=")
+			configSet = true
 		}
 	}
-	return path, noConfig
+	return path, noConfig, configSet
 }
 
 func defaultConfigPath() (string, error) {
@@ -85,6 +91,9 @@ func applyConfigFile(opts options) (options, error) {
 	data, err := os.ReadFile(opts.configPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if opts.configSet {
+				return opts, err
+			}
 			return opts, nil
 		}
 		return opts, err

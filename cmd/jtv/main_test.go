@@ -173,6 +173,19 @@ func TestRunUsesConfigOutput(t *testing.T) {
 	}
 }
 
+func TestRunErrorsWhenExplicitConfigIsMissing(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-config", filepath.Join(t.TempDir(), "missing.toml"), "-f", "-", "-q", "select id"}, strings.NewReader(`[{"id":1}]`), &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected missing explicit config error")
+	}
+	if !strings.Contains(err.Error(), "missing.toml") {
+		t.Fatalf("error = %q, want missing config path", err.Error())
+	}
+}
+
 func TestRunOutputFlagOverridesConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
