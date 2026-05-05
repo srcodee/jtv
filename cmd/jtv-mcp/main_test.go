@@ -28,8 +28,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	}
 	result := responses[1]["result"].(map[string]any)
 	tools := result["tools"].([]any)
-	if len(tools) != 3 {
-		t.Fatalf("tools = %d, want 3", len(tools))
+	if len(tools) != 4 {
+		t.Fatalf("tools = %d, want 4", len(tools))
 	}
 }
 
@@ -71,6 +71,35 @@ func TestMCPSchemaTool(t *testing.T) {
 	fields := structured["fields"].([]any)
 	if !containsAny(fields, "user.name") {
 		t.Fatalf("fields = %#v, want user.name", fields)
+	}
+}
+
+func TestMCPStreamQueryTool(t *testing.T) {
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_stream_query","arguments":{"data":"{\"time\":\"t1\",\"status\":\"ok\"}\n{\"time\":\"t2\",\"status\":\"fail\"}","query":"select time, status"}}}`
+	var out bytes.Buffer
+
+	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := decodeResponses(t, out.String())
+	result := responses[0]["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("tool returned error: %#v", result)
+	}
+	structured := result["structuredContent"].(map[string]any)
+	if structured["processed"] != float64(2) {
+		t.Fatalf("processed = %#v, want 2", structured["processed"])
+	}
+	events := structured["events"].([]any)
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2", len(events))
+	}
+	first := events[0].(map[string]any)
+	objects := first["objects"].([]any)
+	row := objects[0].(map[string]any)
+	if row["status"] != "ok" {
+		t.Fatalf("first object = %#v, want status ok", row)
 	}
 }
 

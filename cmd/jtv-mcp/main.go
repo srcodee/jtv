@@ -98,6 +98,17 @@ func newServer() *server {
 			}, nil),
 			Handler: handlePreview,
 		},
+		{
+			Name:        "jtv_stream_query",
+			Description: "Run a SQL query independently for each NDJSON line. Provide either data or file_path.",
+			InputSchema: objectSchema(map[string]any{
+				"data":      stringSchema("Inline NDJSON input. Each non-empty line is one JSON value."),
+				"file_path": stringSchema("Local NDJSON file path."),
+				"query":     stringSchema("SQL query to run against each line, for example: select time, status."),
+				"limit":     numberSchema("Maximum number of non-empty lines to process. Default is all lines."),
+			}, []string{"query"}),
+			Handler: handleStreamQuery,
+		},
 	}
 	return s
 }
@@ -279,22 +290,86 @@ func handlePreview(ctx context.Context, args map[string]any) (toolResult, error)
 	return jsonToolResult(resultPayload(result))
 }
 
-func datasetFromArgs(args map[string]any) (*jtvcore.Dataset, error) {
-	data := stringArg(args, "data")
-	source := "inline"
-	if data == "" {
-		path := stringArg(args, "file_path")
-		if path == "" {
-			return nil, errors.New("data or file_path is required")
+func handleStreamQuery(ctx context.Context, args map[string]any) (toolResult, error) {
+	query := stringArg(args, "query")
+	if query == "" {
+		return toolResult{}, errors.New("query is required")
+	}
+	data, source, err := inputDataFromArgs(args)
+	if err != nil {
+		return toolResult{}, err
+	}
+	limit := intArg(args, "limit", 0)
+	if limit < 0 {
+		return toolResult{}, errors.New("limit must be >= 0")
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(data))
+	scanner.Buffer(make([]byte, 1024*64), 1024*1024*16)
+	events := make([]map[string]any, 0)
+	lineNumber := 0
+	processed := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
 		}
-		raw, err := os.ReadFile(path)
+		if limit > 0 && processed >= limit {
+			break
+		}
+		processed++
+		event := map[string]any{"line": lineNumber}
+		ds, err := jtvcore.NewDataset([]byte(line), fmt.Sprintf("%s:%d", source, lineNumber))
 		if err != nil {
-			return nil, err
+			event["error"] = err.Error()
+			events = append(events, event)
+			continue
 		}
-		data = string(raw)
-		source = path
+		result, err := ds.Query(ctx, query)
+		ds.Close()
+		if err != nil {
+			event["error"] = err.Error()
+			events = append(events, event)
+			continue
+		}
+		event["columns"] = result.Columns
+		event["rows"] = result.Rows
+		event["objects"] = resultRowsAsObjects(result)
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		return toolResult{}, err
+	}
+
+	return jsonToolResult(map[string]any{
+		"events":    events,
+		"processed": processed,
+	})
+}
+
+func datasetFromArgs(args map[string]any) (*jtvcore.Dataset, error) {
+	data, source, err := inputDataFromArgs(args)
+	if err != nil {
+		return nil, err
 	}
 	return jtvcore.NewDataset([]byte(data), source)
+}
+
+func inputDataFromArgs(args map[string]any) (string, string, error) {
+	data := stringArg(args, "data")
+	if data != "" {
+		return data, "inline", nil
+	}
+	path := stringArg(args, "file_path")
+	if path == "" {
+		return "", "", errors.New("data or file_path is required")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	return string(raw), path, nil
 }
 
 func resultPayload(result *jtvcore.QueryResult) map[string]any {

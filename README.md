@@ -286,6 +286,8 @@ Available tools:
 jtv_query    query inline data or a local file with SQL
 jtv_schema   list detected flattened fields
 jtv_preview  preview the first rows
+jtv_stream_query
+             run a query independently for each NDJSON line
 ```
 
 Each tool accepts either `data` or `file_path`. `jtv_query` also requires
@@ -295,4 +297,10 @@ Example `tools/call` request:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"file_path":"examples/users.json","query":"select user.name, count(*) as total group by user.name"}}}
+```
+
+Example stream query request:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jtv_stream_query","arguments":{"data":"{\"time\":\"t1\",\"status\":\"ok\"}\n{\"time\":\"t2\",\"status\":\"fail\"}","query":"select time, status"}}}
 ```
