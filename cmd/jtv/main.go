@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const version = "0.1.0"
+const version = "0.1.2"
 
 type options struct {
 	file       string

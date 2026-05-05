@@ -214,7 +214,7 @@ func TestRunVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
 	}
-	if stdout.String() != "jtv 0.1.0\n" {
+	if stdout.String() != "jtv 0.1.2\n" {
 		t.Fatalf("stdout = %q, want version", stdout.String())
 	}
 }
