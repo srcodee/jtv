@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -108,6 +110,18 @@ func newServer() *server {
 				"limit":     numberSchema("Maximum number of non-empty lines to process. Default is all lines."),
 			}, []string{"query"}),
 			Handler: handleStreamQuery,
+		},
+		{
+			Name:        "jtv_export",
+			Description: "Query JSON, NDJSON, or CSV data and write the result to a CSV or JSON file.",
+			InputSchema: objectSchema(map[string]any{
+				"data":        stringSchema("Inline JSON, NDJSON, or CSV input."),
+				"file_path":   stringSchema("Local JSON, NDJSON, or CSV file path."),
+				"query":       stringSchema("SQL query to export."),
+				"output_path": stringSchema("File path to write. .csv and .json are supported."),
+				"format":      stringSchema("Optional output format: csv or json. Defaults to output_path extension."),
+			}, []string{"query", "output_path"}),
+			Handler: handleExport,
 		},
 	}
 	return s
@@ -348,6 +362,41 @@ func handleStreamQuery(ctx context.Context, args map[string]any) (toolResult, er
 	})
 }
 
+func handleExport(ctx context.Context, args map[string]any) (toolResult, error) {
+	ds, err := datasetFromArgs(args)
+	if err != nil {
+		return toolResult{}, err
+	}
+	defer ds.Close()
+
+	query := stringArg(args, "query")
+	if query == "" {
+		return toolResult{}, errors.New("query is required")
+	}
+	outputPath := stringArg(args, "output_path")
+	if outputPath == "" {
+		return toolResult{}, errors.New("output_path is required")
+	}
+	format, err := exportFormat(outputPath, stringArg(args, "format"))
+	if err != nil {
+		return toolResult{}, err
+	}
+
+	result, err := ds.Query(ctx, query)
+	if err != nil {
+		return toolResult{}, err
+	}
+	if err := writeExportFile(outputPath, format, result); err != nil {
+		return toolResult{}, err
+	}
+	return jsonToolResult(map[string]any{
+		"output_path": outputPath,
+		"format":      format,
+		"rows":        len(result.Rows),
+		"columns":     result.Columns,
+	})
+}
+
 func datasetFromArgs(args map[string]any) (*jtvcore.Dataset, error) {
 	data, source, err := inputDataFromArgs(args)
 	if err != nil {
@@ -392,6 +441,63 @@ func resultRowsAsObjects(result *jtvcore.QueryResult) []map[string]any {
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+func exportFormat(outputPath, requested string) (string, error) {
+	format := strings.ToLower(strings.TrimSpace(requested))
+	if format == "" {
+		switch strings.ToLower(filepath.Ext(outputPath)) {
+		case ".json":
+			format = "json"
+		case ".csv", "":
+			format = "csv"
+		default:
+			return "", fmt.Errorf("unsupported output extension %q; use .csv or .json", filepath.Ext(outputPath))
+		}
+	}
+	switch format {
+	case "csv", "json":
+		return format, nil
+	default:
+		return "", errors.New("format must be csv or json")
+	}
+}
+
+func writeExportFile(path, format string, result *jtvcore.QueryResult) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	switch format {
+	case "csv":
+		return writeCSV(file, result)
+	case "json":
+		return writeJSON(file, result)
+	default:
+		return errors.New("format must be csv or json")
+	}
+}
+
+func writeCSV(w io.Writer, result *jtvcore.QueryResult) error {
+	writer := csv.NewWriter(w)
+	if err := writer.Write(result.Columns); err != nil {
+		return err
+	}
+	for _, row := range result.Rows {
+		if err := writer.Write(row); err != nil {
+			return err
+		}
+	}
+	writer.Flush()
+	return writer.Error()
+}
+
+func writeJSON(w io.Writer, result *jtvcore.QueryResult) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(resultRowsAsObjects(result))
 }
 
 func jsonValue(value any) any {

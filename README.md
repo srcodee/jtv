@@ -288,6 +288,7 @@ jtv_schema   list detected flattened fields
 jtv_preview  preview the first rows
 jtv_stream_query
              run a query independently for each NDJSON line
+jtv_export   query data and write CSV or JSON output to a file
 ```
 
 Each tool accepts either `data` or `file_path`. `jtv_query` also requires
@@ -303,4 +304,10 @@ Example stream query request:
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jtv_stream_query","arguments":{"data":"{\"time\":\"t1\",\"status\":\"ok\"}\n{\"time\":\"t2\",\"status\":\"fail\"}","query":"select time, status"}}}
+```
+
+Example export request:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jtv_export","arguments":{"file_path":"examples/users.json","query":"select id, user.name, status","output_path":"users.csv"}}}
 ```

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -28,8 +30,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	}
 	result := responses[1]["result"].(map[string]any)
 	tools := result["tools"].([]any)
-	if len(tools) != 4 {
-		t.Fatalf("tools = %d, want 4", len(tools))
+	if len(tools) != 5 {
+		t.Fatalf("tools = %d, want 5", len(tools))
 	}
 }
 
@@ -100,6 +102,57 @@ func TestMCPStreamQueryTool(t *testing.T) {
 	row := objects[0].(map[string]any)
 	if row["status"] != "ok" {
 		t.Fatalf("first object = %#v, want status ok", row)
+	}
+}
+
+func TestMCPExportToolCSV(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "users.csv")
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_export","arguments":{"data":"[{\"id\":1,\"user\":{\"name\":\"Ana\"}},{\"id\":2,\"user\":{\"name\":\"Budi\"}}]","query":"select id, user.name order by id","output_path":"` + outputPath + `"}}}`
+	var out bytes.Buffer
+
+	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := decodeResponses(t, out.String())
+	result := responses[0]["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("tool returned error: %#v", result)
+	}
+	structured := result["structuredContent"].(map[string]any)
+	if structured["rows"] != float64(2) || structured["format"] != "csv" {
+		t.Fatalf("structured = %#v, want csv with 2 rows", structured)
+	}
+	raw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "id,user.name\n1,Ana\n2,Budi\n"
+	if string(raw) != want {
+		t.Fatalf("export = %q, want %q", string(raw), want)
+	}
+}
+
+func TestMCPExportToolJSON(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "users.json")
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_export","arguments":{"data":"[{\"id\":1,\"user\":{\"name\":\"Ana\"}}]","query":"select id, user.name","output_path":"` + outputPath + `"}}}`
+	var out bytes.Buffer
+
+	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := decodeResponses(t, out.String())
+	result := responses[0]["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("tool returned error: %#v", result)
+	}
+	raw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"user.name": "Ana"`) {
+		t.Fatalf("export json = %s, want user.name Ana", string(raw))
 	}
 }
 
