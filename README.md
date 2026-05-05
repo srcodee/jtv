@@ -55,11 +55,17 @@ Without `-q`, `jtv` starts an interactive prompt with SQL autocomplete.
 --csv       write query output as CSV
 --json      write query output as pretty JSON
 --stream    read NDJSON continuously and run -q for each line
+-config FILE
+            read defaults from FILE instead of the user config path
+--no-config ignore config file
 ```
 
 If no output flag is set, results are printed as an ASCII table. With `-o`, the
 format is inferred from the file extension. An empty or `.csv` extension writes
 CSV; `.json` writes JSON.
+
+`--csv` and `--json` override the configured default output format for a single
+command.
 
 ## Input
 
@@ -99,6 +105,18 @@ Stream mode requires `-q`. It does not support `-o`; redirect stdout instead.
 Invalid lines or query errors are reported to stderr and the stream continues.
 With `--json`, stream output is JSON Lines. With `--csv`, the header is written
 once.
+
+## Config
+
+`jtv` reads optional defaults from `~/.config/jtv/config.toml`:
+
+```toml
+output = "table"  # table, csv, or json
+pagesize = 25
+```
+
+Use `-config path/to/config.toml` to choose another config file or `--no-config`
+to ignore config. CLI flags always win over config values.
 
 ## Interactive Commands
 
@@ -174,6 +192,13 @@ array field, so it returns one row per expanded array item.
 The original row is also available as `raw`, but it is not included in
 `select *`.
 
+If a query references a field that does not exist, `jtv` suggests the nearest
+detected field when it can:
+
+```text
+no such column: user.nmae; did you mean user.name?
+```
+
 ## Charts
 
 Chart commands are available in interactive mode:
@@ -202,4 +227,40 @@ This repository includes sample files:
 ./jtv -f examples/users.json -q "select id, user.name, status"
 ./jtv -f examples/users.csv -q "select status, count(*) group by status"
 ./jtv -f examples/orders.json -q "select id, orders.users.id"
+```
+
+Filter rows:
+
+```bash
+./jtv -f examples/users.json -q "select id, user.name where status = 'ok'"
+./jtv -f examples/users.csv -q "select id, user.name where user.active = 1"
+```
+
+Group and sort values:
+
+```bash
+./jtv -f examples/users.json -q "select user.name, count(*) as total group by user.name order by total desc"
+./jtv -f examples/users.csv -q "select status, count(*) as total group by status order by total desc"
+```
+
+Inspect nested arrays:
+
+```bash
+./jtv -f examples/orders.json -q "select id, orders.id, orders.users.name"
+./jtv -f examples/orders.json -q "select orders.users.name, count(*) as total group by orders.users.name"
+```
+
+Export results:
+
+```bash
+./jtv -f examples/users.json -q "select id, user.name, status" --csv
+./jtv -f examples/users.json -q "select id, user.name, status" --json
+./jtv -f examples/users.json -q "select id, user.name, status" -o users.csv
+./jtv -f examples/users.json -q "select id, user.name, status" -o users.json
+```
+
+Explore interactively:
+
+```bash
+./jtv -f examples/users.json
 ```

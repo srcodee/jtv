@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -21,12 +22,165 @@ import (
 )
 
 type options struct {
-	file   string
-	query  string
-	output string
-	csv    bool
-	json   bool
-	stream bool
+	file       string
+	query      string
+	output     string
+	configPath string
+	csv        bool
+	json       bool
+	stream     bool
+	noConfig   bool
+	pageSize   int
+}
+
+func defaultOptions(args []string) (options, error) {
+	opts := options{pageSize: defaultPageSize}
+	configPath, noConfig := configArgs(args)
+	opts.configPath = configPath
+	opts.noConfig = noConfig
+	if noConfig {
+		return opts, nil
+	}
+	if opts.configPath == "" {
+		path, err := defaultConfigPath()
+		if err != nil {
+			return opts, nil
+		}
+		opts.configPath = path
+	}
+	return applyConfigFile(opts)
+}
+
+func configArgs(args []string) (string, bool) {
+	var path string
+	noConfig := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--no-config" || arg == "-no-config":
+			noConfig = true
+		case arg == "--config" || arg == "-config":
+			if i+1 < len(args) {
+				path = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--config="):
+			path = strings.TrimPrefix(arg, "--config=")
+		case strings.HasPrefix(arg, "-config="):
+			path = strings.TrimPrefix(arg, "-config=")
+		}
+	}
+	return path, noConfig
+}
+
+func defaultConfigPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "jtv", "config.toml"), nil
+}
+
+func applyConfigFile(opts options) (options, error) {
+	data, err := os.ReadFile(opts.configPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return opts, nil
+		}
+		return opts, err
+	}
+	cfg, err := parseConfig(data)
+	if err != nil {
+		return opts, fmt.Errorf("%s: %w", opts.configPath, err)
+	}
+	if cfg.pageSize > 0 {
+		opts.pageSize = cfg.pageSize
+	}
+	switch cfg.output {
+	case "csv":
+		opts.csv = true
+		opts.json = false
+	case "json":
+		opts.csv = false
+		opts.json = true
+	case "table", "":
+		opts.csv = false
+		opts.json = false
+	default:
+		return opts, fmt.Errorf("%s: output must be table, csv, or json", opts.configPath)
+	}
+	return opts, nil
+}
+
+type configFile struct {
+	output   string
+	pageSize int
+}
+
+func parseConfig(data []byte) (configFile, error) {
+	var cfg configFile
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := stripConfigComment(strings.TrimSpace(scanner.Text()))
+		if line == "" || strings.HasPrefix(line, "[") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return cfg, fmt.Errorf("line %d: expected key = value", lineNumber)
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		switch key {
+		case "output":
+			cfg.output = strings.ToLower(value)
+		case "pagesize", "page_size":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 {
+				return cfg, fmt.Errorf("line %d: pagesize must be >= 1", lineNumber)
+			}
+			cfg.pageSize = n
+		default:
+			return cfg, fmt.Errorf("line %d: unknown config key %q", lineNumber, key)
+		}
+	}
+	return cfg, scanner.Err()
+}
+
+func stripConfigComment(line string) string {
+	inQuote := byte(0)
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if inQuote != 0 {
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			inQuote = ch
+			continue
+		}
+		if ch == '#' {
+			return strings.TrimSpace(line[:i])
+		}
+	}
+	return line
+}
+
+func resolveOutputFlagOverrides(fs *flag.FlagSet, opts *options) {
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	if visited["csv"] && !visited["json"] {
+		opts.json = false
+	}
+	if visited["json"] && !visited["csv"] {
+		opts.csv = false
+	}
 }
 
 func main() {
@@ -37,18 +191,24 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	var opts options
+	opts, err := defaultOptions(args)
+	if err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("jtv", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.StringVar(&opts.file, "f", "", "input JSON/NDJSON/CSV file, or - for stdin")
 	fs.StringVar(&opts.query, "q", "", "SQL query to execute")
 	fs.StringVar(&opts.output, "o", "", "write output to file; format is inferred from extension")
-	fs.BoolVar(&opts.csv, "csv", false, "write query result as CSV")
-	fs.BoolVar(&opts.json, "json", false, "write query result as JSON")
+	fs.StringVar(&opts.configPath, "config", opts.configPath, "config file path")
+	fs.BoolVar(&opts.csv, "csv", opts.csv, "write query result as CSV")
+	fs.BoolVar(&opts.json, "json", opts.json, "write query result as JSON")
 	fs.BoolVar(&opts.stream, "stream", false, "read NDJSON continuously and run query for each line")
+	fs.BoolVar(&opts.noConfig, "no-config", opts.noConfig, "ignore config file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	resolveOutputFlagOverrides(fs, &opts)
 
 	if opts.stream {
 		return runStream(fs.Args(), stdin, stdout, opts)
@@ -66,7 +226,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	defer ds.Close()
 
 	if opts.query == "" {
-		return runInteractive(ds, stdin, stdout)
+		return runInteractive(ds, stdin, stdout, opts.pageSize)
 	}
 
 	result, err := ds.Query(context.Background(), opts.query)
@@ -172,14 +332,14 @@ func isTerminal(r io.Reader) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-func runInteractive(ds *Dataset, stdin io.Reader, out io.Writer) error {
+func runInteractive(ds *Dataset, stdin io.Reader, out io.Writer, pageSize int) error {
 	restore := restoreTerminalOnExit(stdin)
 	defer restore()
 
 	printWelcome(out, ds)
 
 	var last *QueryResult
-	var pager pageState
+	pager := pageState{size: pageSize}
 	var history []string
 	completer := makeCompleter(ds.Fields)
 	reader := bufio.NewReader(stdin)

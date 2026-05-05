@@ -400,3 +400,21 @@ func TestScalarTopLevelFieldCollapsesExpandedRows(t *testing.T) {
 		t.Fatalf("rows = %d, want 2", len(result.Rows))
 	}
 }
+
+func TestQuerySuggestsClosestField(t *testing.T) {
+	data := []byte(`[{"user":{"name":"Ana"},"status":"ok"}]`)
+
+	ds, err := NewDataset(data, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	_, err = ds.Query(context.Background(), "select user.nmae")
+	if err == nil {
+		t.Fatal("expected unknown field error")
+	}
+	if !strings.Contains(err.Error(), "did you mean user.name?") {
+		t.Fatalf("error = %q, want user.name suggestion", err.Error())
+	}
+}

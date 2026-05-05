@@ -86,7 +86,7 @@ func (d *Dataset) Query(ctx context.Context, query string) (*QueryResult, error)
 	rewritten := rewriteQuery(query, d.Fields)
 	rows, err := d.db.QueryContext(ctx, rewritten)
 	if err != nil {
-		return nil, err
+		return nil, enrichQueryError(err, d.Fields)
 	}
 	defer rows.Close()
 
@@ -119,9 +119,84 @@ func (d *Dataset) Count(ctx context.Context, query string) (int, error) {
 
 	var total int
 	if err := d.db.QueryRowContext(ctx, countSQL).Scan(&total); err != nil {
-		return 0, err
+		return 0, enrichQueryError(err, d.Fields)
 	}
 	return total, nil
+}
+
+func enrichQueryError(err error, fields []string) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	const prefix = "no such column: "
+	index := strings.Index(message, prefix)
+	if index == -1 {
+		return err
+	}
+	field := strings.TrimSpace(message[index+len(prefix):])
+	if parts := strings.Fields(field); len(parts) > 0 {
+		field = parts[0]
+	}
+	field = strings.Trim(field, "`\"'")
+	field = strings.TrimSuffix(field, ";")
+	if field == "" {
+		return err
+	}
+	if suggestion := closestField(field, fields); suggestion != "" {
+		return fmt.Errorf("%w; did you mean %s?", err, suggestion)
+	}
+	return fmt.Errorf("%w; use ls or schema to list available fields", err)
+}
+
+func closestField(target string, fields []string) string {
+	bestField := ""
+	bestDistance := 0
+	target = strings.ToLower(target)
+	for _, field := range fields {
+		if field == "raw" {
+			continue
+		}
+		distance := levenshtein(target, strings.ToLower(field))
+		limit := max(2, len(target)/3)
+		if distance > limit {
+			continue
+		}
+		if bestField == "" || distance < bestDistance {
+			bestField = field
+			bestDistance = distance
+		}
+	}
+	return bestField
+}
+
+func levenshtein(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if a == "" {
+		return len(b)
+	}
+	if b == "" {
+		return len(a)
+	}
+	prev := make([]int, len(b)+1)
+	curr := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		curr[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			curr[j] = min(min(prev[j]+1, curr[j-1]+1), prev[j-1]+cost)
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(b)]
 }
 
 func (d *Dataset) load(rows []map[string]any) error {
