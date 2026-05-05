@@ -289,6 +289,12 @@ jtv_preview  preview the first rows
 jtv_stream_query
              run a query independently for each NDJSON line
 jtv_export   query data and write CSV or JSON output to a file
+jtv_stream_start
+             start a stateful NDJSON file stream session
+jtv_stream_read
+             read and query new lines from a stream session
+jtv_stream_stop
+             stop a stream session
 ```
 
 Each tool accepts either `data` or `file_path`. `jtv_query` also requires
@@ -310,4 +316,25 @@ Example export request:
 
 ```json
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jtv_export","arguments":{"file_path":"examples/users.json","query":"select id, user.name, status","output_path":"users.csv"}}}
+```
+
+Example stream session requests:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jtv_stream_start","arguments":{"file_path":"events.ndjson","query":"select time, status"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jtv_stream_read","arguments":{"session_id":"stream-1","limit":10}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"jtv_stream_stop","arguments":{"session_id":"stream-1"}}}
+```
+
+Example MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "jtv": {
+      "command": "/absolute/path/to/jtv-mcp",
+      "args": []
+    }
+  }
+}
 ```

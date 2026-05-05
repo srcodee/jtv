@@ -1006,35 +1006,6 @@ func writeJSONFile(path string, result *QueryResult) error {
 	return writeJSON(file, result)
 }
 
-func writeCSV(w io.Writer, result *QueryResult) error {
-	writer := csv.NewWriter(w)
-	if err := writer.Write(result.Columns); err != nil {
-		return err
-	}
-	for _, row := range result.Rows {
-		if err := writer.Write(row); err != nil {
-			return err
-		}
-	}
-	writer.Flush()
-	return writer.Error()
-}
-
-func writeJSON(w io.Writer, result *QueryResult) error {
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(resultRowsAsObjects(result))
-}
-
-func jsonValue(value any) any {
-	switch v := value.(type) {
-	case []byte:
-		return string(v)
-	default:
-		return v
-	}
-}
-
 type streamWriter struct {
 	out         io.Writer
 	opts        options
@@ -1114,20 +1085,6 @@ func (w *streamWriter) writeTableRows(result *QueryResult) error {
 		printDataRow(w.out, row, w.widths)
 	}
 	return nil
-}
-
-func resultRowsAsObjects(result *QueryResult) []map[string]any {
-	rows := make([]map[string]any, 0, len(result.Values))
-	for _, values := range result.Values {
-		row := make(map[string]any, len(result.Columns))
-		for i, column := range result.Columns {
-			if i < len(values) {
-				row[column] = jsonValue(values[i])
-			}
-		}
-		rows = append(rows, row)
-	}
-	return rows
 }
 
 func printTable(w io.Writer, result *QueryResult) {

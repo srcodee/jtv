@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,7 +56,18 @@ type contentBlock struct {
 }
 
 type server struct {
-	tools []tool
+	tools   []tool
+	streams map[string]*streamSession
+	nextID  int
+}
+
+type streamSession struct {
+	ID       string
+	FilePath string
+	Query    string
+	Offset   int64
+	Line     int
+	Done     bool
 }
 
 func main() {
@@ -68,7 +78,7 @@ func main() {
 }
 
 func newServer() *server {
-	s := &server{}
+	s := &server{streams: map[string]*streamSession{}}
 	s.tools = []tool{
 		{
 			Name:        "jtv_query",
@@ -122,6 +132,32 @@ func newServer() *server {
 				"format":      stringSchema("Optional output format: csv or json. Defaults to output_path extension."),
 			}, []string{"query", "output_path"}),
 			Handler: handleExport,
+		},
+		{
+			Name:        "jtv_stream_start",
+			Description: "Start a stateful NDJSON file stream session. Use jtv_stream_read to process new lines.",
+			InputSchema: objectSchema(map[string]any{
+				"file_path": stringSchema("Local NDJSON file path to read incrementally."),
+				"query":     stringSchema("SQL query to run independently for each new line."),
+			}, []string{"file_path", "query"}),
+			Handler: s.handleStreamStart,
+		},
+		{
+			Name:        "jtv_stream_read",
+			Description: "Read and query new lines from a stream session created by jtv_stream_start.",
+			InputSchema: objectSchema(map[string]any{
+				"session_id": stringSchema("Stream session ID returned by jtv_stream_start."),
+				"limit":      numberSchema("Maximum number of new non-empty lines to process. Default is all available lines."),
+			}, []string{"session_id"}),
+			Handler: s.handleStreamRead,
+		},
+		{
+			Name:        "jtv_stream_stop",
+			Description: "Stop and remove a stream session created by jtv_stream_start.",
+			InputSchema: objectSchema(map[string]any{
+				"session_id": stringSchema("Stream session ID returned by jtv_stream_start."),
+			}, []string{"session_id"}),
+			Handler: s.handleStreamStop,
 		},
 	}
 	return s
@@ -333,24 +369,7 @@ func handleStreamQuery(ctx context.Context, args map[string]any) (toolResult, er
 			break
 		}
 		processed++
-		event := map[string]any{"line": lineNumber}
-		ds, err := jtvcore.NewDataset([]byte(line), fmt.Sprintf("%s:%d", source, lineNumber))
-		if err != nil {
-			event["error"] = err.Error()
-			events = append(events, event)
-			continue
-		}
-		result, err := ds.Query(ctx, query)
-		ds.Close()
-		if err != nil {
-			event["error"] = err.Error()
-			events = append(events, event)
-			continue
-		}
-		event["columns"] = result.Columns
-		event["rows"] = result.Rows
-		event["objects"] = resultRowsAsObjects(result)
-		events = append(events, event)
+		events = append(events, queryStreamLine(ctx, []byte(line), query, source, lineNumber))
 	}
 	if err := scanner.Err(); err != nil {
 		return toolResult{}, err
@@ -397,6 +416,132 @@ func handleExport(ctx context.Context, args map[string]any) (toolResult, error) 
 	})
 }
 
+func (s *server) handleStreamStart(ctx context.Context, args map[string]any) (toolResult, error) {
+	_ = ctx
+	filePath := stringArg(args, "file_path")
+	if filePath == "" {
+		return toolResult{}, errors.New("file_path is required")
+	}
+	query := stringArg(args, "query")
+	if query == "" {
+		return toolResult{}, errors.New("query is required")
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		return toolResult{}, err
+	}
+	s.nextID++
+	id := fmt.Sprintf("stream-%d", s.nextID)
+	session := &streamSession{ID: id, FilePath: filePath, Query: query}
+	s.streams[id] = session
+	return jsonToolResult(map[string]any{
+		"session_id": id,
+		"file_path":  filePath,
+		"query":      query,
+	})
+}
+
+func (s *server) handleStreamRead(ctx context.Context, args map[string]any) (toolResult, error) {
+	sessionID := stringArg(args, "session_id")
+	if sessionID == "" {
+		return toolResult{}, errors.New("session_id is required")
+	}
+	session, ok := s.streams[sessionID]
+	if !ok {
+		return toolResult{}, errors.New("unknown stream session: " + sessionID)
+	}
+	limit := intArg(args, "limit", 0)
+	if limit < 0 {
+		return toolResult{}, errors.New("limit must be >= 0")
+	}
+
+	events, processed, offset, err := readStreamSession(ctx, session, limit)
+	if err != nil {
+		return toolResult{}, err
+	}
+	session.Offset = offset
+	session.Line += processed
+
+	return jsonToolResult(map[string]any{
+		"session_id": session.ID,
+		"events":     events,
+		"processed":  processed,
+		"offset":     session.Offset,
+		"line":       session.Line,
+		"done":       session.Done,
+	})
+}
+
+func (s *server) handleStreamStop(ctx context.Context, args map[string]any) (toolResult, error) {
+	_ = ctx
+	sessionID := stringArg(args, "session_id")
+	if sessionID == "" {
+		return toolResult{}, errors.New("session_id is required")
+	}
+	if _, ok := s.streams[sessionID]; !ok {
+		return toolResult{}, errors.New("unknown stream session: " + sessionID)
+	}
+	delete(s.streams, sessionID)
+	return jsonToolResult(map[string]any{"session_id": sessionID, "stopped": true})
+}
+
+func readStreamSession(ctx context.Context, session *streamSession, limit int) ([]map[string]any, int, int64, error) {
+	file, err := os.Open(session.FilePath)
+	if err != nil {
+		return nil, 0, session.Offset, err
+	}
+	defer file.Close()
+
+	if _, err := file.Seek(session.Offset, io.SeekStart); err != nil {
+		return nil, 0, session.Offset, err
+	}
+	reader := bufio.NewReader(file)
+	events := make([]map[string]any, 0)
+	processed := 0
+	offset := session.Offset
+	for {
+		if limit > 0 && processed >= limit {
+			break
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, 0, offset, err
+		}
+		if line == "" && errors.Is(err, io.EOF) {
+			break
+		}
+		offset += int64(len(line))
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			processed++
+			event := queryStreamLine(ctx, []byte(trimmed), session.Query, session.FilePath, session.Line+processed)
+			events = append(events, event)
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+	}
+	return events, processed, offset, nil
+}
+
+func queryStreamLine(ctx context.Context, line []byte, query, source string, lineNumber int) map[string]any {
+	event := map[string]any{"line": lineNumber}
+	ds, err := jtvcore.NewDataset(line, fmt.Sprintf("%s:%d", source, lineNumber))
+	if err != nil {
+		event["error"] = err.Error()
+		return event
+	}
+	result, err := ds.Query(ctx, query)
+	ds.Close()
+	if err != nil {
+		event["error"] = err.Error()
+		return event
+	}
+	event["columns"] = result.Columns
+	event["rows"] = result.Rows
+	event["objects"] = jtvcore.ResultRowsAsObjects(result)
+	return event
+}
+
 func datasetFromArgs(args map[string]any) (*jtvcore.Dataset, error) {
 	data, source, err := inputDataFromArgs(args)
 	if err != nil {
@@ -425,22 +570,8 @@ func resultPayload(result *jtvcore.QueryResult) map[string]any {
 	return map[string]any{
 		"columns": result.Columns,
 		"rows":    result.Rows,
-		"objects": resultRowsAsObjects(result),
+		"objects": jtvcore.ResultRowsAsObjects(result),
 	}
-}
-
-func resultRowsAsObjects(result *jtvcore.QueryResult) []map[string]any {
-	rows := make([]map[string]any, 0, len(result.Values))
-	for _, values := range result.Values {
-		row := make(map[string]any, len(result.Columns))
-		for i, column := range result.Columns {
-			if i < len(values) {
-				row[column] = jsonValue(values[i])
-			}
-		}
-		rows = append(rows, row)
-	}
-	return rows
 }
 
 func exportFormat(outputPath, requested string) (string, error) {
@@ -472,40 +603,11 @@ func writeExportFile(path, format string, result *jtvcore.QueryResult) error {
 
 	switch format {
 	case "csv":
-		return writeCSV(file, result)
+		return jtvcore.WriteCSV(file, result)
 	case "json":
-		return writeJSON(file, result)
+		return jtvcore.WriteJSON(file, result)
 	default:
 		return errors.New("format must be csv or json")
-	}
-}
-
-func writeCSV(w io.Writer, result *jtvcore.QueryResult) error {
-	writer := csv.NewWriter(w)
-	if err := writer.Write(result.Columns); err != nil {
-		return err
-	}
-	for _, row := range result.Rows {
-		if err := writer.Write(row); err != nil {
-			return err
-		}
-	}
-	writer.Flush()
-	return writer.Error()
-}
-
-func writeJSON(w io.Writer, result *jtvcore.QueryResult) error {
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(resultRowsAsObjects(result))
-}
-
-func jsonValue(value any) any {
-	switch v := value.(type) {
-	case []byte:
-		return string(v)
-	default:
-		return v
 	}
 }
 

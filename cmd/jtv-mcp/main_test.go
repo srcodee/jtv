@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,8 +31,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	}
 	result := responses[1]["result"].(map[string]any)
 	tools := result["tools"].([]any)
-	if len(tools) != 5 {
-		t.Fatalf("tools = %d, want 5", len(tools))
+	if len(tools) != 8 {
+		t.Fatalf("tools = %d, want 8", len(tools))
 	}
 }
 
@@ -102,6 +103,65 @@ func TestMCPStreamQueryTool(t *testing.T) {
 	row := objects[0].(map[string]any)
 	if row["status"] != "ok" {
 		t.Fatalf("first object = %#v, want status ok", row)
+	}
+}
+
+func TestMCPStreamSessionTools(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.ndjson")
+	if err := os.WriteFile(path, []byte("{\"status\":\"ok\"}\n{\"status\":\"fail\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_stream_start","arguments":{"file_path":"` + path + `","query":"select status"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jtv_stream_read","arguments":{"session_id":"stream-1","limit":1}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jtv_stream_read","arguments":{"session_id":"stream-1"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jtv_stream_stop","arguments":{"session_id":"stream-1"}}}`,
+	}, "\n")
+	var out bytes.Buffer
+
+	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := decodeResponses(t, out.String())
+	if len(responses) != 4 {
+		t.Fatalf("responses = %d, want 4: %s", len(responses), out.String())
+	}
+	firstRead := responses[1]["result"].(map[string]any)["structuredContent"].(map[string]any)
+	if firstRead["processed"] != float64(1) {
+		t.Fatalf("first read = %#v, want 1 processed", firstRead)
+	}
+	secondRead := responses[2]["result"].(map[string]any)["structuredContent"].(map[string]any)
+	if secondRead["processed"] != float64(1) {
+		t.Fatalf("second read = %#v, want 1 processed", secondRead)
+	}
+	stop := responses[3]["result"].(map[string]any)["structuredContent"].(map[string]any)
+	if stop["stopped"] != true {
+		t.Fatalf("stop = %#v, want stopped", stop)
+	}
+}
+
+func TestMCPStdioBinaryIntegration(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "jtv-mcp")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, output)
+	}
+
+	cmd := exec.Command(bin)
+	cmd.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}` + "\n")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	responses := decodeResponses(t, out.String())
+	result := responses[0]["result"].(map[string]any)
+	if len(result["tools"].([]any)) != 8 {
+		t.Fatalf("tools result = %#v", result)
 	}
 }
 
