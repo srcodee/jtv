@@ -283,7 +283,7 @@ go build -buildvcs=false -o jtv-mcp ./cmd/jtv-mcp
 Available tools:
 
 ```text
-jtv_query    query inline data or a local file with SQL
+jtv_query    query inline data, a local file, or a URL with SQL
 jtv_schema   list detected flattened fields
 jtv_preview  preview the first rows
 jtv_stream_query
@@ -297,8 +297,11 @@ jtv_stream_stop
              stop a stream session
 ```
 
-Each tool accepts either `data` or `file_path`. `jtv_query` also requires
-`query`.
+Data tools accept `data`, `file_path`, or `url`. URL input also accepts optional
+`method`, `headers`, `body`, and `body_file` arguments for requests that need
+POST, PUT, PATCH, DELETE, cookies, bearer tokens, CSRF tokens, or request
+payloads. Use `url` in MCP when you would normally run `curl URL | jtv` in the
+CLI. `jtv_query` also requires `query`.
 
 Example `tools/call` request:
 
@@ -306,24 +309,42 @@ Example `tools/call` request:
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"file_path":"examples/users.json","query":"select user.name, count(*) as total group by user.name"}}}
 ```
 
+Example URL request:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"https://dummyjson.com/carts","query":"select \"carts.products.title\", \"carts.products.discountPercentage\" order by \"carts.products.discountPercentage\" desc limit 1"}}}
+```
+
+Example URL request with cookie and CSRF headers:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"https://example.test/api/orders","headers":{"Cookie":"session=abc","X-CSRF-Token":"token-123","Authorization":"Bearer secret"},"query":"select id, total order by total desc limit 10"}}}
+```
+
+Example POST request with a JSON body:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"https://example.test/api/search","method":"POST","headers":{"Content-Type":"application/json","Authorization":"Bearer secret"},"body":"{\"active\":true}","query":"select id, status"}}}
+```
+
 Example stream query request:
 
 ```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jtv_stream_query","arguments":{"data":"{\"time\":\"t1\",\"status\":\"ok\"}\n{\"time\":\"t2\",\"status\":\"fail\"}","query":"select time, status"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jtv_stream_query","arguments":{"data":"{\"time\":\"t1\",\"status\":\"ok\"}\n{\"time\":\"t2\",\"status\":\"fail\"}","query":"select time, status"}}}
 ```
 
 Example export request:
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jtv_export","arguments":{"file_path":"examples/users.json","query":"select id, user.name, status","output_path":"users.csv"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"jtv_export","arguments":{"file_path":"examples/users.json","query":"select id, user.name, status","output_path":"users.csv"}}}
 ```
 
 Example stream session requests:
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jtv_stream_start","arguments":{"file_path":"events.ndjson","query":"select time, status"}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jtv_stream_read","arguments":{"session_id":"stream-1","limit":10}}}
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"jtv_stream_stop","arguments":{"session_id":"stream-1"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"jtv_stream_start","arguments":{"file_path":"events.ndjson","query":"select time, status"}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"jtv_stream_read","arguments":{"session_id":"stream-1","limit":10}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"jtv_stream_stop","arguments":{"session_id":"stream-1"}}}
 ```
 
 Example MCP client configuration:

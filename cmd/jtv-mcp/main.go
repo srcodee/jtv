@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +19,7 @@ import (
 )
 
 const version = "0.1.2"
+const maxURLInputBytes = 50 * 1024 * 1024
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -82,10 +85,15 @@ func newServer() *server {
 	s.tools = []tool{
 		{
 			Name:        "jtv_query",
-			Description: "Query JSON, NDJSON, or CSV data with SQL. Provide either data or file_path.",
+			Description: "Query JSON, NDJSON, or CSV data with SQL. Provide data, file_path, or url.",
 			InputSchema: objectSchema(map[string]any{
 				"data":      stringSchema("Inline JSON, NDJSON, or CSV input."),
 				"file_path": stringSchema("Local JSON, NDJSON, or CSV file path."),
+				"url":       stringSchema("HTTP(S) URL returning JSON, NDJSON, or CSV input."),
+				"headers":   stringMapSchema("Optional HTTP headers for url input, such as Cookie, Authorization, or X-CSRF-Token."),
+				"method":    stringSchema("Optional HTTP method for url input. Defaults to GET. Common values: GET, POST, PUT, PATCH, DELETE."),
+				"body":      stringSchema("Optional HTTP request body for url input."),
+				"body_file": stringSchema("Optional local file path to read as the HTTP request body for url input."),
 				"query":     stringSchema("SQL query, for example: select user.name, count(*) group by user.name"),
 			}, []string{"query"}),
 			Handler: handleQuery,
@@ -96,6 +104,11 @@ func newServer() *server {
 			InputSchema: objectSchema(map[string]any{
 				"data":      stringSchema("Inline JSON, NDJSON, or CSV input."),
 				"file_path": stringSchema("Local JSON, NDJSON, or CSV file path."),
+				"url":       stringSchema("HTTP(S) URL returning JSON, NDJSON, or CSV input."),
+				"headers":   stringMapSchema("Optional HTTP headers for url input, such as Cookie, Authorization, or X-CSRF-Token."),
+				"method":    stringSchema("Optional HTTP method for url input. Defaults to GET. Common values: GET, POST, PUT, PATCH, DELETE."),
+				"body":      stringSchema("Optional HTTP request body for url input."),
+				"body_file": stringSchema("Optional local file path to read as the HTTP request body for url input."),
 				"filter":    stringSchema("Optional substring filter for field names."),
 			}, nil),
 			Handler: handleSchema,
@@ -106,16 +119,26 @@ func newServer() *server {
 			InputSchema: objectSchema(map[string]any{
 				"data":      stringSchema("Inline JSON, NDJSON, or CSV input."),
 				"file_path": stringSchema("Local JSON, NDJSON, or CSV file path."),
+				"url":       stringSchema("HTTP(S) URL returning JSON, NDJSON, or CSV input."),
+				"headers":   stringMapSchema("Optional HTTP headers for url input, such as Cookie, Authorization, or X-CSRF-Token."),
+				"method":    stringSchema("Optional HTTP method for url input. Defaults to GET. Common values: GET, POST, PUT, PATCH, DELETE."),
+				"body":      stringSchema("Optional HTTP request body for url input."),
+				"body_file": stringSchema("Optional local file path to read as the HTTP request body for url input."),
 				"limit":     numberSchema("Maximum number of rows to return. Default is 10."),
 			}, nil),
 			Handler: handlePreview,
 		},
 		{
 			Name:        "jtv_stream_query",
-			Description: "Run a SQL query independently for each NDJSON line. Provide either data or file_path.",
+			Description: "Run a SQL query independently for each NDJSON line. Provide data, file_path, or url.",
 			InputSchema: objectSchema(map[string]any{
 				"data":      stringSchema("Inline NDJSON input. Each non-empty line is one JSON value."),
 				"file_path": stringSchema("Local NDJSON file path."),
+				"url":       stringSchema("HTTP(S) URL returning NDJSON input."),
+				"headers":   stringMapSchema("Optional HTTP headers for url input, such as Cookie, Authorization, or X-CSRF-Token."),
+				"method":    stringSchema("Optional HTTP method for url input. Defaults to GET. Common values: GET, POST, PUT, PATCH, DELETE."),
+				"body":      stringSchema("Optional HTTP request body for url input."),
+				"body_file": stringSchema("Optional local file path to read as the HTTP request body for url input."),
 				"query":     stringSchema("SQL query to run against each line, for example: select time, status."),
 				"limit":     numberSchema("Maximum number of non-empty lines to process. Default is all lines."),
 			}, []string{"query"}),
@@ -127,6 +150,11 @@ func newServer() *server {
 			InputSchema: objectSchema(map[string]any{
 				"data":        stringSchema("Inline JSON, NDJSON, or CSV input."),
 				"file_path":   stringSchema("Local JSON, NDJSON, or CSV file path."),
+				"url":         stringSchema("HTTP(S) URL returning JSON, NDJSON, or CSV input."),
+				"headers":     stringMapSchema("Optional HTTP headers for url input, such as Cookie, Authorization, or X-CSRF-Token."),
+				"method":      stringSchema("Optional HTTP method for url input. Defaults to GET. Common values: GET, POST, PUT, PATCH, DELETE."),
+				"body":        stringSchema("Optional HTTP request body for url input."),
+				"body_file":   stringSchema("Optional local file path to read as the HTTP request body for url input."),
 				"query":       stringSchema("SQL query to export."),
 				"output_path": stringSchema("File path to write. .csv and .json are supported."),
 				"format":      stringSchema("Optional output format: csv or json. Defaults to output_path extension."),
@@ -556,14 +584,83 @@ func inputDataFromArgs(args map[string]any) (string, string, error) {
 		return data, "inline", nil
 	}
 	path := stringArg(args, "file_path")
-	if path == "" {
-		return "", "", errors.New("data or file_path is required")
+	if path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", "", err
+		}
+		return string(raw), path, nil
 	}
-	raw, err := os.ReadFile(path)
+	inputURL := stringArg(args, "url")
+	if inputURL != "" {
+		raw, err := readURLInput(inputURL, args)
+		if err != nil {
+			return "", "", err
+		}
+		return string(raw), inputURL, nil
+	}
+	return "", "", errors.New("data, file_path, or url is required")
+}
+
+func readURLInput(rawURL string, args map[string]any) ([]byte, error) {
+	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
-	return string(raw), path, nil
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, errors.New("url must use http or https")
+	}
+	method := strings.ToUpper(strings.TrimSpace(stringArg(args, "method")))
+	if method == "" {
+		method = http.MethodGet
+	}
+	body, err := requestBodyFromArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(method, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range stringMapArg(args, "headers") {
+		req.Header.Set(key, value)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("url returned HTTP status %s", resp.Status)
+	}
+	limited := io.LimitReader(resp.Body, maxURLInputBytes+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxURLInputBytes {
+		return nil, fmt.Errorf("url response exceeds %d bytes", maxURLInputBytes)
+	}
+	return raw, nil
+}
+
+func requestBodyFromArgs(args map[string]any) (io.Reader, error) {
+	body := stringArg(args, "body")
+	bodyFile := stringArg(args, "body_file")
+	if body != "" && bodyFile != "" {
+		return nil, errors.New("body and body_file are mutually exclusive")
+	}
+	if body != "" {
+		return strings.NewReader(body), nil
+	}
+	if bodyFile == "" {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(bodyFile)
+	if err != nil {
+		return nil, err
+	}
+	return strings.NewReader(string(raw)), nil
 }
 
 func resultPayload(result *jtvcore.QueryResult) map[string]any {
@@ -666,6 +763,30 @@ func intArg(args map[string]any, key string, fallback int) int {
 	return fallback
 }
 
+func stringMapArg(args map[string]any, key string) map[string]string {
+	value, ok := args[key]
+	if !ok || value == nil {
+		return nil
+	}
+	raw, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		if v == nil {
+			continue
+		}
+		switch typed := v.(type) {
+		case string:
+			out[k] = typed
+		default:
+			out[k] = fmt.Sprint(typed)
+		}
+	}
+	return out
+}
+
 func objectSchema(properties map[string]any, required []string) map[string]any {
 	schema := map[string]any{
 		"type":       "object",
@@ -683,6 +804,14 @@ func stringSchema(description string) map[string]any {
 
 func numberSchema(description string) map[string]any {
 	return map[string]any{"type": "number", "description": description}
+}
+
+func stringMapSchema(description string) map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"description":          description,
+		"additionalProperties": map[string]any{"type": "string"},
+	}
 }
 
 func resultResponse(id json.RawMessage, result any) rpcResponse {

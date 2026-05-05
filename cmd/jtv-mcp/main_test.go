@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +60,85 @@ func TestMCPQueryTool(t *testing.T) {
 	first := rows[0].([]any)
 	if first[0] != "Ana" {
 		t.Fatalf("first row = %#v, want Ana", first)
+	}
+}
+
+func TestMCPQueryToolURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-CSRF-Token") != "token-123" {
+			http.Error(w, "missing csrf", http.StatusForbidden)
+			return
+		}
+		if r.Header.Get("Cookie") != "session=abc" {
+			http.Error(w, "missing cookie", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":1,"name":"Ana","score":90},{"id":2,"name":"Budi","score":75}]`))
+	}))
+	defer srv.Close()
+
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"` + srv.URL + `","headers":{"Cookie":"session=abc","X-CSRF-Token":"token-123"},"query":"select name, score order by score desc limit 1"}}}`
+	var out bytes.Buffer
+
+	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := decodeResponses(t, out.String())
+	result := responses[0]["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("tool returned error: %#v", result)
+	}
+	structured := result["structuredContent"].(map[string]any)
+	objects := structured["objects"].([]any)
+	first := objects[0].(map[string]any)
+	if first["name"] != "Ana" || first["score"] != float64(90) {
+		t.Fatalf("first object = %#v, want Ana score 90", first)
+	}
+}
+
+func TestMCPQueryToolURLMethodAndBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "wrong method", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			http.Error(w, "missing authorization", http.StatusForbidden)
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if string(raw) != `{"active":true}` {
+			http.Error(w, "wrong body", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":1,"status":"ok"}]`))
+	}))
+	defer srv.Close()
+
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jtv_query","arguments":{"url":"` + srv.URL + `","method":"POST","headers":{"Authorization":"Bearer secret","Content-Type":"application/json"},"body":"{\"active\":true}","query":"select id, status"}}}`
+	var out bytes.Buffer
+
+	if err := newServer().Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := decodeResponses(t, out.String())
+	result := responses[0]["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("tool returned error: %#v", result)
+	}
+	structured := result["structuredContent"].(map[string]any)
+	objects := structured["objects"].([]any)
+	first := objects[0].(map[string]any)
+	if first["status"] != "ok" {
+		t.Fatalf("first object = %#v, want status ok", first)
 	}
 }
 
