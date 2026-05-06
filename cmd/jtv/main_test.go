@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,12 +147,20 @@ func TestParseConfig(t *testing.T) {
 # jtv defaults
 output = "json"
 pagesize = 25
+
+[headers.example.test]
+Authorization = "Bearer token"
+X-Test = "from-config"
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.output != "json" || cfg.pageSize != 25 {
 		t.Fatalf("cfg = %#v, want json pagesize 25", cfg)
+	}
+	if cfg.headers["example.test"]["Authorization"] != "Bearer token" ||
+		cfg.headers["example.test"]["X-Test"] != "from-config" {
+		t.Fatalf("headers = %#v, want example.test headers", cfg.headers)
 	}
 }
 
@@ -214,8 +225,107 @@ func TestRunVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
 	}
-	if stdout.String() != "jtv 0.1.2\n" {
+	if stdout.String() != "jtv 0.1.4\n" {
 		t.Fatalf("stdout = %q, want version", stdout.String())
+	}
+}
+
+func TestRunHelp(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	help := stderr.String()
+	for _, want := range []string{
+		"jtv 0.1.4",
+		"Usage:",
+		"jtv --version",
+		"Input:",
+		"request files: curl, PowerShell Invoke-WebRequest, or raw HTTP",
+		"Query examples:",
+		"Inspection commands:",
+		`max(rows.price) as x where money(rows.price) > 10000`,
+		"Numeric helpers:",
+		"sum FIELD, max FIELD, min FIELD, avg FIELD",
+		"Interactive commands:",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help = %q, want %q", help, want)
+		}
+	}
+}
+
+func TestAggregateShortcutQuery(t *testing.T) {
+	query, err := aggregateShortcutQuery("sum", "rows.price where int(rows.price) > 10000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "select sum(number(rows.price)) as sum where int(rows.price) > 10000"
+	if query != want {
+		t.Fatalf("query = %q, want %q", query, want)
+	}
+}
+
+func TestAggregateFunctionShortcutQuery(t *testing.T) {
+	query, ok, err := expandAggregateShortcutLine("max(rows.price) as x where money(rows.price) > 10000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected aggregate function shortcut")
+	}
+	want := "select max(number(rows.price)) as x where money(rows.price) > 10000"
+	if query != want {
+		t.Fatalf("query = %q, want %q", query, want)
+	}
+}
+
+func TestRunAggregateShortcut(t *testing.T) {
+	stdin := strings.NewReader(`[
+		{"price":"Rp 10.000"},
+		{"price":"Rp 20.000"},
+		{"price":"Rp 30.000"}
+	]`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "-q", "sum price"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "60000") {
+		t.Fatalf("stdout = %q, want sum 60000", stdout.String())
+	}
+}
+
+func TestRunAggregateShortcutHonorsCSVOutput(t *testing.T) {
+	stdin := strings.NewReader(`[{"price":"Rp 10.000"},{"price":"Rp 20.000"}]`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "--csv", "-q", "max price"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if stdout.String() != "max\n20000\n" {
+		t.Fatalf("stdout = %q, want CSV max", stdout.String())
+	}
+}
+
+func TestRunAggregateFunctionShortcut(t *testing.T) {
+	stdin := strings.NewReader(`[{"price":"Rp 10.000"},{"price":"Rp 20.000"}]`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "-q", "max(price) as x where money(price) > 10000"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "x") || !strings.Contains(stdout.String(), "20000") {
+		t.Fatalf("stdout = %q, want alias x and max 20000", stdout.String())
 	}
 }
 
@@ -228,8 +338,10 @@ func TestRunQueryCommandSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "user.name") {
-		t.Fatalf("stdout = %q, want user.name field", stdout.String())
+	for _, want := range []string{"user.name", "string", "Ana"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
 	}
 }
 
@@ -258,6 +370,217 @@ func TestRunQueryCommandPreview(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "1 row(s)") {
 		t.Fatalf("stdout = %q, want one preview row", stdout.String())
+	}
+}
+
+func TestRunFileCurlBashRequest(t *testing.T) {
+	server := requestEchoServer(t)
+	path := writeTempFile(t, `curl '`+server.URL+`/api/user' \
+  -H 'Accept: application/json' \
+  -H 'X-Test: bash' \
+  -b 'session=abc; theme=dark'`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", path, "-q", "select ok, source, cookie_session"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "1") || !strings.Contains(got, "bash") || !strings.Contains(got, "abc") {
+		t.Fatalf("stdout = %q, want bash request echo", got)
+	}
+}
+
+func TestRunFileCurlWindowsRequest(t *testing.T) {
+	server := requestEchoServer(t)
+	path := writeTempFile(t, `curl ^"`+server.URL+`/api/user^" ^
+  -H ^"Accept: application/json^" ^
+  -H ^"X-Test: cmd^" ^
+  -b ^"session=abc^%^3D; token=a^$b^"`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", path, "-q", "select source, cookie_session, cookie_token"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "cmd") || !strings.Contains(got, "abc%3D") || !strings.Contains(got, "a$b") {
+		t.Fatalf("stdout = %q, want cmd request echo", got)
+	}
+}
+
+func TestRunFilePowerShellRequest(t *testing.T) {
+	server := requestEchoServer(t)
+	path := writeTempFile(t, `$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+$session.UserAgent = "test-agent"
+$session.Cookies.Add((New-Object System.Net.Cookie("session", "ps-cookie", "/", ".example.test")))
+Invoke-WebRequest -UseBasicParsing -Uri "`+server.URL+`/api/user" `+"`"+`
+-WebSession $session `+"`"+`
+-Headers @{
+"Accept"="application/json"
+  "X-Test"="powershell"
+} `+"`"+`
+-ContentType "application/json"`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", path, "-q", "select source, cookie_session, user_agent"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "powershell") || !strings.Contains(got, "ps-cookie") || !strings.Contains(got, "test-agent") {
+		t.Fatalf("stdout = %q, want powershell request echo", got)
+	}
+}
+
+func TestRunFileRequestRejectsHTMLResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "br") || strings.Contains(r.Header.Get("Accept-Encoding"), "zstd") {
+			t.Fatalf("Accept-Encoding was forwarded: %q", r.Header.Get("Accept-Encoding"))
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><title>Login</title></html>`)
+	}))
+	t.Cleanup(server.Close)
+	path := writeTempFile(t, `curl '`+server.URL+`' -H 'Accept-Encoding: gzip, deflate, br, zstd'`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", path, "-q", "select *"}, strings.NewReader(""), &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected HTML response error")
+	}
+	if !strings.Contains(err.Error(), "expected JSON/NDJSON/CSV response") {
+		t.Fatalf("error = %q, want response type hint", err.Error())
+	}
+}
+
+func TestRunDirectURLInput(t *testing.T) {
+	server := requestEchoServer(t)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", server.URL + "/api/user", "-q", "select ok"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "1") {
+		t.Fatalf("stdout = %q, want ok row", stdout.String())
+	}
+}
+
+func TestRunShowRequest(t *testing.T) {
+	server := requestEchoServer(t)
+	path := writeTempFile(t, `curl '`+server.URL+`/api/user' -H 'Authorization: secret' -H 'X-Test: show'`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", path, "--show-request"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "GET "+server.URL+"/api/user") ||
+		!strings.Contains(got, "Authorization(redacted)") ||
+		strings.Contains(got, "secret") {
+		t.Fatalf("stdout = %q, want safe request summary", got)
+	}
+}
+
+func TestRunDebugRequestAndSaveResponse(t *testing.T) {
+	server := requestEchoServer(t)
+	savePath := filepath.Join(t.TempDir(), "response.json")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", server.URL + "/api/user", "--debug-request", "--save-response", savePath, "-q", "select ok"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	debug := stderr.String()
+	if !strings.Contains(debug, "response: 200 OK") || !strings.Contains(debug, "content-type: application/json") {
+		t.Fatalf("stderr = %q, want response debug info", debug)
+	}
+	saved, err := os.ReadFile(savePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved), `"ok":true`) {
+		t.Fatalf("saved response = %q, want JSON body", string(saved))
+	}
+}
+
+func TestRunRootOption(t *testing.T) {
+	stdin := strings.NewReader(`{"data":[{"id":1},{"id":2}],"meta":{"total":2}}`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "--root", "data", "-q", "select id"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "1") || !strings.Contains(stdout.String(), "2") {
+		t.Fatalf("stdout = %q, want rooted rows", stdout.String())
+	}
+}
+
+func TestRunConfigHeadersForURL(t *testing.T) {
+	server := requestEchoServer(t)
+	u := strings.TrimPrefix(server.URL, "http://")
+	host := strings.Split(u, ":")[0]
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	config := "[headers." + host + "]\nX-Test = \"from-config\"\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-config", configPath, "-f", server.URL + "/api/user", "-q", "select source"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "from-config") {
+		t.Fatalf("stdout = %q, want configured header echo", stdout.String())
+	}
+}
+
+func TestRunDelimiterFlag(t *testing.T) {
+	stdin := strings.NewReader("id|name\n1|Ana\n")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "--delimiter", "|", "-q", "select name"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Ana") {
+		t.Fatalf("stdout = %q, want Ana", stdout.String())
+	}
+}
+
+func TestRunFileRawHTTPRequest(t *testing.T) {
+	server := requestEchoServer(t)
+	host := strings.TrimPrefix(server.URL, "http://")
+	path := writeTempFile(t, `GET /api/user HTTP/1.1
+Host: `+host+`
+Accept: application/json
+X-Test: raw
+Cookie: session=raw-cookie
+`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", path, "-q", "select source, cookie_session"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "raw") || !strings.Contains(got, "raw-cookie") {
+		t.Fatalf("stdout = %q, want raw request echo", got)
 	}
 }
 
@@ -346,4 +669,32 @@ func splitShellFields(line string) ([]string, error) {
 		fields = append(fields, b.String())
 	}
 	return fields, nil
+}
+
+func requestEchoServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		session := ""
+		token := ""
+		if cookie, err := r.Cookie("session"); err == nil {
+			session = cookie.Value
+		}
+		if cookie, err := r.Cookie("token"); err == nil {
+			token = cookie.Value
+		}
+		fmt.Fprintf(w, `{"ok":true,"source":%q,"cookie_session":%q,"cookie_token":%q,"user_agent":%q}`,
+			r.Header.Get("X-Test"), session, token, r.UserAgent())
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func writeTempFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "request.txt")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

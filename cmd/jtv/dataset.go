@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -13,14 +14,18 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"modernc.org/sqlite"
 )
 
 type Dataset struct {
-	Source      string
-	Fields      []string
-	FieldLabels map[string]string
-	ArrayFields map[string]bool
-	RowCount    int
+	Source       string
+	Fields       []string
+	FieldLabels  map[string]string
+	FieldTypes   map[string]string
+	FieldSamples map[string]string
+	ArrayFields  map[string]bool
+	RowCount     int
 
 	db *sql.DB
 }
@@ -31,8 +36,37 @@ type QueryResult struct {
 	Values  [][]any
 }
 
+func init() {
+	registerNumericFunction("int", func(value float64) driver.Value {
+		return int64(value)
+	})
+	registerNumericFunction("float", func(value float64) driver.Value {
+		return value
+	})
+	registerNumericFunction("number", func(value float64) driver.Value {
+		return value
+	})
+	registerNumericFunction("money", func(value float64) driver.Value {
+		return value
+	})
+}
+
+func registerNumericFunction(name string, convert func(float64) driver.Value) {
+	sqlite.MustRegisterDeterministicScalarFunction(name, 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		value, err := numericValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return convert(value), nil
+	})
+}
+
 func NewDataset(data []byte, source string) (*Dataset, error) {
-	rows, err := parseRows(data)
+	return NewDatasetWithDelimiter(data, source, "")
+}
+
+func NewDatasetWithDelimiter(data []byte, source, delimiter string) (*Dataset, error) {
+	rows, err := parseRows(data, delimiter)
 	if err != nil {
 		return nil, err
 	}
@@ -57,18 +91,22 @@ func NewDataset(data []byte, source string) (*Dataset, error) {
 
 	fields := sortedKeys(fieldSet)
 	labels := buildFieldLabels(fields, arrayPaths)
+	fieldTypes, fieldSamples := buildFieldExamples(fields, flatRows)
 	arrayFields := buildArrayFields(fields, arrayPaths)
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, err
 	}
+
 	ds := &Dataset{
-		Source:      source,
-		Fields:      fields,
-		FieldLabels: labels,
-		ArrayFields: arrayFields,
-		RowCount:    len(flatRows),
-		db:          db,
+		Source:       source,
+		Fields:       fields,
+		FieldLabels:  labels,
+		FieldTypes:   fieldTypes,
+		FieldSamples: fieldSamples,
+		ArrayFields:  arrayFields,
+		RowCount:     len(flatRows),
+		db:           db,
 	}
 	if err := ds.load(flatRows); err != nil {
 		db.Close()
@@ -258,12 +296,12 @@ func (d *Dataset) applyQueryDefaults(query string) string {
 	return query
 }
 
-func parseRows(data []byte) ([]any, error) {
+func parseRows(data []byte, delimiter string) ([]any, error) {
 	rows, jsonErr := parseJSONRows(data)
 	if jsonErr == nil {
 		return rows, nil
 	}
-	rows, csvErr := parseCSVRows(data)
+	rows, csvErr := parseCSVRows(data, delimiter)
 	if csvErr == nil {
 		return rows, nil
 	}
@@ -306,13 +344,18 @@ func parseJSONRows(data []byte) ([]any, error) {
 	return rows, nil
 }
 
-func parseCSVRows(data []byte) ([]any, error) {
+func parseCSVRows(data []byte, delimiter string) ([]any, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
 		return nil, errors.New("empty input")
 	}
 
+	comma, err := csvDelimiter(trimmed, delimiter)
+	if err != nil {
+		return nil, err
+	}
 	reader := csv.NewReader(bytes.NewReader(trimmed))
+	reader.Comma = comma
 	reader.FieldsPerRecord = -1
 	records, err := reader.ReadAll()
 	if err != nil {
@@ -349,6 +392,51 @@ func parseCSVRows(data []byte) ([]any, error) {
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+func csvDelimiter(data []byte, delimiter string) (rune, error) {
+	delimiter = strings.TrimSpace(delimiter)
+	switch strings.ToLower(delimiter) {
+	case "", "auto":
+		return detectCSVDelimiter(data), nil
+	case "tab", "\\t", "t":
+		return '\t', nil
+	}
+	runes := []rune(delimiter)
+	if len(runes) != 1 {
+		return 0, fmt.Errorf("delimiter must be one character, auto, or tab")
+	}
+	switch runes[0] {
+	case ',', ';', '|', '\t':
+		return runes[0], nil
+	default:
+		return 0, fmt.Errorf("unsupported delimiter %q; use comma, semicolon, pipe, or tab", delimiter)
+	}
+}
+
+func detectCSVDelimiter(data []byte) rune {
+	line := firstNonEmptyLine(string(data))
+	candidates := []rune{',', ';', '|', '\t'}
+	best := ','
+	bestCount := -1
+	for _, candidate := range candidates {
+		count := strings.Count(line, string(candidate))
+		if count > bestCount {
+			best = candidate
+			bestCount = count
+		}
+	}
+	return best
+}
+
+func firstNonEmptyLine(data string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(data, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func parseScalar(value string) any {
@@ -439,6 +527,81 @@ func buildFieldLabels(fields []string, arrayPaths map[string]struct{}) map[strin
 		labels[field] = labelField(field, arrayPaths)
 	}
 	return labels
+}
+
+func buildFieldExamples(fields []string, rows []map[string]any) (map[string]string, map[string]string) {
+	types := make(map[string]string, len(fields))
+	samples := make(map[string]string, len(fields))
+	for _, row := range rows {
+		for _, field := range fields {
+			if field == "raw" {
+				continue
+			}
+			if types[field] != "" && samples[field] != "" {
+				continue
+			}
+			value, ok := row[field]
+			if !ok || value == nil {
+				continue
+			}
+			if types[field] == "" {
+				types[field] = valueTypeName(value)
+			}
+			if samples[field] == "" {
+				samples[field] = sampleValue(value)
+			}
+		}
+	}
+	for _, field := range fields {
+		if field == "raw" {
+			continue
+		}
+		if types[field] == "" {
+			types[field] = "null"
+		}
+	}
+	return types, samples
+}
+
+func valueTypeName(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "bool"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return "int"
+	case float32, float64, json.Number:
+		return "number"
+	case string:
+		return "string"
+	default:
+		return "json"
+	}
+}
+
+func sampleValue(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return truncateDisplay(v, 60)
+	case []byte:
+		return truncateDisplay(string(v), 60)
+	default:
+		return truncateDisplay(fmt.Sprint(v), 60)
+	}
+}
+
+func truncateDisplay(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return value[:limit]
+	}
+	return value[:limit-3] + "..."
 }
 
 func buildArrayFields(fields []string, arrayPaths map[string]struct{}) map[string]bool {
@@ -533,6 +696,139 @@ func sqliteValue(value any) any {
 	}
 }
 
+func numericValue(value any) (float64, error) {
+	switch v := value.(type) {
+	case nil:
+		return 0, nil
+	case int64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case bool:
+		if v {
+			return 1, nil
+		}
+		return 0, nil
+	case string:
+		return parseFormattedNumber(v)
+	case []byte:
+		return parseFormattedNumber(string(v))
+	default:
+		return parseFormattedNumber(fmt.Sprint(v))
+	}
+}
+
+func parseFormattedNumber(value string) (float64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case unicode.IsDigit(r):
+			b.WriteRune(r)
+		case r == '.' || r == ',' || r == '-' || r == '+':
+			b.WriteRune(r)
+		}
+	}
+	cleaned := normalizeNumberSeparators(trimNumberSeparators(b.String()))
+	if cleaned == "" || cleaned == "-" || cleaned == "+" {
+		return 0, formattedNumberError(value)
+	}
+	n, err := strconv.ParseFloat(cleaned, 64)
+	if err != nil {
+		return 0, formattedNumberError(value)
+	}
+	return n, nil
+}
+
+func formattedNumberError(value string) error {
+	return fmt.Errorf("cannot convert %q to number; expected a value like 1000, 1.000, Rp 1.000, or 1.234,50", value)
+}
+
+func trimNumberSeparators(value string) string {
+	value = strings.TrimSpace(value)
+	sign := ""
+	if strings.HasPrefix(value, "-") || strings.HasPrefix(value, "+") {
+		sign = value[:1]
+		value = value[1:]
+	}
+	value = strings.Trim(value, ".,")
+	return sign + value
+}
+
+func normalizeNumberSeparators(value string) string {
+	value = keepLeadingSign(value)
+	lastDot := strings.LastIndex(value, ".")
+	lastComma := strings.LastIndex(value, ",")
+	if lastDot == -1 && lastComma == -1 {
+		return value
+	}
+	if lastDot != -1 && lastComma != -1 {
+		decimal := byte('.')
+		thousands := byte(',')
+		if lastComma > lastDot {
+			decimal = ','
+			thousands = '.'
+		}
+		value = strings.ReplaceAll(value, string(thousands), "")
+		return replaceLastSeparator(value, decimal)
+	}
+
+	separator := byte('.')
+	if lastComma != -1 {
+		separator = ','
+	}
+	if looksLikeThousandsSeparated(value, separator) {
+		return strings.ReplaceAll(value, string(separator), "")
+	}
+	return replaceLastSeparator(value, separator)
+}
+
+func keepLeadingSign(value string) string {
+	var b strings.Builder
+	signWritten := false
+	for i, r := range value {
+		if (r == '-' || r == '+') && i == 0 && !signWritten {
+			b.WriteRune(r)
+			signWritten = true
+			continue
+		}
+		if unicode.IsDigit(r) || r == '.' || r == ',' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func looksLikeThousandsSeparated(value string, separator byte) bool {
+	parts := strings.Split(value, string(separator))
+	if len(parts) < 2 {
+		return false
+	}
+	first := strings.TrimLeft(parts[0], "+-")
+	if len(first) == 0 || len(first) > 3 {
+		return false
+	}
+	for _, part := range parts[1:] {
+		if len(part) != 3 {
+			return false
+		}
+	}
+	return true
+}
+
+func replaceLastSeparator(value string, separator byte) string {
+	index := strings.LastIndex(value, string(separator))
+	if index == -1 {
+		return value
+	}
+	value = strings.ReplaceAll(value[:index], string(separator), "") + "." + strings.ReplaceAll(value[index+1:], string(separator), "")
+	return value
+}
+
 func stringifyRow(values []any) []string {
 	row := make([]string, len(values))
 	for i, value := range values {
@@ -576,20 +872,21 @@ func shouldDistinctScalarQuery(query string, fields []string, arrayFields map[st
 		return false
 	}
 
-	fieldSet := make(map[string]struct{}, len(fields))
+	fieldMap := make(map[string]string, len(fields))
 	for _, field := range fields {
-		fieldSet[field] = struct{}{}
+		fieldMap[strings.ToLower(field)] = field
 	}
 	for _, expr := range expressions {
-		field := stripAlias(expr)
-		if field == "*" || strings.ContainsAny(field, "()+-/*") {
+		fieldExpr := stripAlias(expr)
+		if fieldExpr == "*" || strings.ContainsAny(fieldExpr, "()+-/*") {
 			return false
 		}
-		field = strings.Trim(field, "`\"")
-		if _, ok := fieldSet[field]; !ok {
+		fieldExpr = strings.Trim(fieldExpr, "`\"")
+		actualField, ok := fieldMap[strings.ToLower(fieldExpr)]
+		if !ok {
 			return false
 		}
-		if arrayFields[field] {
+		if arrayFields[actualField] {
 			return false
 		}
 	}
@@ -860,7 +1157,7 @@ func matchField(s string, start int, fields []string) (string, bool) {
 			continue
 		}
 		end := start + len(field)
-		if end > len(s) || s[start:end] != field {
+		if end > len(s) || !strings.EqualFold(s[start:end], field) {
 			continue
 		}
 		if start > 0 && isIdentPart(rune(s[start-1])) {

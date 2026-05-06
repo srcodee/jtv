@@ -27,10 +27,12 @@ go build -buildvcs=false -o jtv ./cmd/jtv
 
 ```bash
 ./jtv -f data.json
+./jtv -f https://example.test/api/users
 ./jtv -f data.ndjson
 ./jtv -f data.csv
 cat data.json | ./jtv
 ./jtv -f data.json -q "select *"
+./jtv -f https://example.test/api/users -q "select id, user.name"
 ./jtv -f data.json -q "select user.name, count(*) group by user.name"
 cat data.ndjson | ./jtv -q "select status, count(*) group by status"
 curl -s https://dummyjson.com/comments | ./jtv
@@ -53,6 +55,16 @@ Without `-q`, `jtv` starts an interactive prompt with SQL autocomplete.
 -f FILE     input JSON, NDJSON, or CSV file; use - for stdin
 -q SQL      SQL query to execute
 -o FILE     write query output to file; .csv and .json are supported
+--delimiter DELIM
+            CSV delimiter: auto, comma, semicolon, pipe, tab, or one character
+--root FIELD
+            use a JSON field as the dataset root
+--show-request
+            print parsed HTTP request without fetching it
+--debug-request
+            print safe HTTP request/response debug info
+--save-response FILE
+            write fetched HTTP response body to file
 --csv       write query output as CSV
 --json      write query output as pretty JSON
 --stream    read NDJSON continuously and run -q for each line
@@ -95,6 +107,69 @@ CSV headers are trimmed. Empty headers become `column_N`, duplicate headers get
 a numeric suffix, and scalar CSV values are parsed as booleans, integers, or
 floats when possible.
 
+CSV delimiters are auto-detected from comma, semicolon, pipe (`|`), and tab.
+Use `--delimiter` to force a delimiter:
+
+```bash
+./jtv -f data.psv --delimiter '|' -q "select id, name"
+./jtv -f data.tsv --delimiter tab -q "select id, name"
+```
+
+`-f` can read public HTTP(S) URLs directly:
+
+```bash
+./jtv -f https://example.test/api/users -q "select id, user.name"
+./jtv -f https://example.test/api/users --root data -q "select id, email"
+```
+
+`-f` can also read a file containing an HTTP request and use the response as
+the dataset. Supported request formats are:
+
+```text
+curl 'https://example.test/api/users' \
+  -H 'Accept: application/json' \
+  -H 'X-Token: ...' \
+  -b 'session=...'
+
+curl ^"https://example.test/api/users^" ^
+  -H ^"Accept: application/json^" ^
+  -b ^"session=...^"
+
+Invoke-WebRequest -Uri "https://example.test/api/users" `
+  -Headers @{"Accept"="application/json"} `
+  -ContentType "application/json"
+
+GET /api/users HTTP/1.1
+Host: example.test
+Accept: application/json
+Cookie: session=...
+```
+
+Request files are parsed and fetched by `jtv`; they are not executed as shell
+scripts. Keep request files private because they often contain cookies, session
+tokens, or authorization headers.
+
+Request helpers:
+
+```bash
+./jtv -f request.txt --show-request
+./jtv -f request.txt --debug-request -q "select * limit 1"
+./jtv -f request.txt --save-response response.json -q "select status"
+./jtv -f response.json -q "select status"
+```
+
+`--show-request` and `--debug-request` redact sensitive header names such as
+`Cookie` and `Authorization`.
+
+Default headers can be stored in the config file by host. Request files override
+configured defaults when they provide the same header:
+
+```toml
+[headers.example.test]
+User-Agent = "jtv"
+Authorization = "Bearer ..."
+```
+
 ## Stream Mode
 
 `--stream` reads one NDJSON object per line and runs the query against each line
@@ -136,6 +211,10 @@ next, n               show the next page
 prev, p               show the previous page
 page N                jump to page N
 pagesize N            set page size
+sum FIELD             sum numeric values
+max FIELD             show maximum numeric value
+min FIELD             show minimum numeric value
+avg FIELD             show average numeric value
 bar FIELD             count by FIELD as a bar chart
 top FIELD [N]         top values by count
 hist FIELD            histogram for numeric FIELD
@@ -167,6 +246,7 @@ Rows are available through the implicit `input` table:
 select *;
 select user.name, user.email where user.active = true;
 select status, count(*) group by status order by count(*) desc;
+select status, count(*) as total group by status having total > 1;
 select id, user.name from input where user.name like 'A%';
 ```
 
@@ -196,6 +276,34 @@ array field, so it returns one row per expanded array item.
 
 The original row is also available as `raw`, but it is not included in
 `select *`.
+
+Formatted numeric strings can be converted inside SQL with `int()`, `float()`,
+`number()`, or `money()`. This is useful for values such as `Rp. 20.000` that
+should be used with comparisons or aggregate functions:
+
+```sql
+select product.name where int(product.price) > 10000;
+select product.name where money(product.price) <= 7500;
+select sum(int(product.price)), max(int(product.price)), min(float(product.price));
+```
+
+The converter ignores surrounding text and currency symbols, understands
+thousand separators like `20.000`, and supports decimal formats such as
+`1.234,50`.
+
+Common SQL and helper functions:
+
+```text
+count(*)       count rows
+sum(value)     sum numeric values
+avg(value)     average numeric values
+min(value)     minimum value
+max(value)     maximum value
+int(value)     convert formatted text to an integer
+float(value)   convert formatted text to a decimal number
+number(value)  convert formatted text to a decimal number
+money(value)   alias for number(value), useful for currency strings
+```
 
 If a query references a field that does not exist, `jtv` suggests the nearest
 detected field when it can:
@@ -246,6 +354,15 @@ Group and sort values:
 ```bash
 ./jtv -f examples/users.json -q "select user.name, count(*) as total group by user.name order by total desc"
 ./jtv -f examples/users.csv -q "select status, count(*) as total group by status order by total desc"
+```
+
+Work with formatted prices:
+
+```bash
+./jtv -f products.json -q "select rows.product, int(rows.price) as price where int(rows.price) > 10000"
+./jtv -f products.json -q "select min(int(rows.price)) as cheapest, max(int(rows.price)) as highest, sum(int(rows.price)) as total"
+./jtv -f products.json -q "sum rows.price"
+./jtv -f products.json -q "max rows.price where int(rows.price) > 10000"
 ```
 
 Inspect nested arrays:

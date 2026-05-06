@@ -103,6 +103,142 @@ func TestQueryCSVInput(t *testing.T) {
 	}
 }
 
+func TestQueryPipeDelimitedInputAutoDetect(t *testing.T) {
+	data := []byte(`id|name|price
+1|Ana|Rp 20.000
+2|Budi|Rp 30.000`)
+
+	ds, err := NewDataset(data, "test.psv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	result, err := ds.Query(context.Background(), "select name, int(price) as price where id = 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(result.Rows[0], ","); got != "Budi,30000" {
+		t.Fatalf("row = %q, want Budi,30000", got)
+	}
+}
+
+func TestQueryDelimitedInputManualTab(t *testing.T) {
+	data := []byte("id\tname\n1\tAna\n")
+
+	ds, err := NewDatasetWithDelimiter(data, "test.tsv", "tab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	result, err := ds.Query(context.Background(), "select name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != "Ana" {
+		t.Fatalf("rows = %v, want Ana", result.Rows)
+	}
+}
+
+func TestQueryFormattedNumberFunctions(t *testing.T) {
+	data := []byte(`[
+		{"product":{"name":"A","price":"Rp. 20.000"}},
+		{"product":{"name":"B","price":"Rp 7.500"}},
+		{"product":{"name":"C","price":"Rp 1.234,50"}}
+	]`)
+
+	ds, err := NewDataset(data, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	result, err := ds.Query(context.Background(), "select product.name where int(product.price) > 10000 order by product.name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "A" {
+		t.Fatalf("rows = %v, want A", result.Rows)
+	}
+
+	result, err = ds.Query(context.Background(), "select count(*) as total where float(product.price) <= 7500")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "2" {
+		t.Fatalf("rows = %v, want count 2", result.Rows)
+	}
+
+	result, err = ds.Query(context.Background(), "select sum(int(product.price)) as total, max(int(product.price)) as highest, min(float(product.price)) as lowest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(result.Rows[0], ","); got != "28734,20000,1234.5" {
+		t.Fatalf("row = %q, want 28734,20000,1234.5", got)
+	}
+
+	result, err = ds.Query(context.Background(), "select number(product.price) as price, money(product.price) as money where product.name = 'A'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(result.Rows[0], ","); got != "20000,20000" {
+		t.Fatalf("row = %q, want 20000,20000", got)
+	}
+}
+
+func TestQueryFormattedNumberErrorIsHelpful(t *testing.T) {
+	ds, err := NewDataset([]byte(`[{"price":"not available"}]`), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	_, err = ds.Query(context.Background(), "select int(price)")
+	if err == nil {
+		t.Fatal("expected conversion error")
+	}
+	if !strings.Contains(err.Error(), `cannot convert "not available" to number`) ||
+		!strings.Contains(err.Error(), "expected a value like 1000") {
+		t.Fatalf("error = %q, want helpful conversion message", err.Error())
+	}
+}
+
+func TestQueryCaseInsensitiveFields(t *testing.T) {
+	data := []byte(`ID,Status,User Name
+1,ok,Ana
+2,fail,Budi`)
+
+	ds, err := NewDataset(data, "test.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	// Query with lowercase field names should work and be quoted correctly
+	result, err := ds.Query(context.Background(), "select id, status, \"user name\" from input order by id")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantCols := []string{"ID", "Status", "User Name"}
+	if strings.Join(result.Columns, ",") != strings.Join(wantCols, ",") {
+		t.Fatalf("columns = %v, want %v", result.Columns, wantCols)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(result.Rows))
+	}
+
+	// Query with mixed case and no quotes for field with space (should be quoted by jtv)
+	result, err = ds.Query(context.Background(), "select user name where status = 'ok'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "Ana" {
+		t.Fatalf("got %v, want Ana", result.Rows)
+	}
+}
+
 func TestRunJSONToStdout(t *testing.T) {
 	stdin := strings.NewReader(`[{"id":1,"user":{"name":"Ana"}}]`)
 	var stdout bytes.Buffer

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,20 +22,26 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const version = "0.1.2"
+const version = "0.1.4"
 
 type options struct {
-	file       string
-	query      string
-	output     string
-	configPath string
-	csv        bool
-	json       bool
-	stream     bool
-	noConfig   bool
-	configSet  bool
-	version    bool
-	pageSize   int
+	file          string
+	query         string
+	output        string
+	delimiter     string
+	configPath    string
+	csv           bool
+	json          bool
+	stream        bool
+	debugRequest  bool
+	showRequest   bool
+	saveResponse  string
+	root          string
+	noConfig      bool
+	configSet     bool
+	version       bool
+	pageSize      int
+	configHeaders map[string]map[string]string
 }
 
 func defaultOptions(args []string) (options, error) {
@@ -108,6 +115,7 @@ func applyConfigFile(opts options) (options, error) {
 	if cfg.pageSize > 0 {
 		opts.pageSize = cfg.pageSize
 	}
+	opts.configHeaders = cfg.headers
 	switch cfg.output {
 	case "csv":
 		opts.csv = true
@@ -127,16 +135,25 @@ func applyConfigFile(opts options) (options, error) {
 type configFile struct {
 	output   string
 	pageSize int
+	headers  map[string]map[string]string
 }
 
 func parseConfig(data []byte) (configFile, error) {
-	var cfg configFile
+	cfg := configFile{headers: map[string]map[string]string{}}
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	lineNumber := 0
+	section := ""
 	for scanner.Scan() {
 		lineNumber++
 		line := stripConfigComment(strings.TrimSpace(scanner.Text()))
-		if line == "" || strings.HasPrefix(line, "[") {
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			if !strings.HasSuffix(line, "]") {
+				return cfg, fmt.Errorf("line %d: invalid section", lineNumber)
+			}
+			section = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
@@ -145,6 +162,20 @@ func parseConfig(data []byte) (configFile, error) {
 		}
 		key = strings.TrimSpace(key)
 		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if strings.HasPrefix(section, "headers.") {
+			host := strings.TrimSpace(strings.TrimPrefix(section, "headers."))
+			if host == "" {
+				return cfg, fmt.Errorf("line %d: headers section requires a host", lineNumber)
+			}
+			if cfg.headers[host] == nil {
+				cfg.headers[host] = map[string]string{}
+			}
+			cfg.headers[host][key] = value
+			continue
+		}
+		if section != "" {
+			return cfg, fmt.Errorf("line %d: unknown config section %q", lineNumber, section)
+		}
 		switch key {
 		case "output":
 			cfg.output = strings.ToLower(value)
@@ -212,13 +243,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.file, "f", "", "input JSON/NDJSON/CSV file, or - for stdin")
 	fs.StringVar(&opts.query, "q", "", "SQL query to execute")
 	fs.StringVar(&opts.output, "o", "", "write output to file; format is inferred from extension")
+	fs.StringVar(&opts.delimiter, "delimiter", "", "CSV delimiter: auto, comma, semicolon, pipe, tab, or one character")
+	fs.StringVar(&opts.root, "root", "", "use a JSON field as the dataset root")
+	fs.StringVar(&opts.saveResponse, "save-response", "", "write fetched HTTP response body to file")
 	fs.StringVar(&opts.configPath, "config", opts.configPath, "config file path")
 	fs.BoolVar(&opts.csv, "csv", opts.csv, "write query result as CSV")
 	fs.BoolVar(&opts.json, "json", opts.json, "write query result as JSON")
 	fs.BoolVar(&opts.stream, "stream", false, "read NDJSON continuously and run query for each line")
+	fs.BoolVar(&opts.debugRequest, "debug-request", false, "print safe HTTP request/response debug info")
+	fs.BoolVar(&opts.showRequest, "show-request", false, "print parsed HTTP request without fetching it")
 	fs.BoolVar(&opts.noConfig, "no-config", opts.noConfig, "ignore config file")
 	fs.BoolVar(&opts.version, "version", false, "print version and exit")
+	fs.Usage = func() {
+		printCLIUsage(stderr, fs)
+	}
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	resolveOutputFlagOverrides(fs, &opts)
@@ -232,12 +274,34 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runStream(fs.Args(), stdin, stdout, opts)
 	}
 
-	data, source, err := readInput(fs.Args(), stdin, opts.file)
+	loaded, err := readInput(fs.Args(), stdin, opts)
+	if err != nil {
+		return err
+	}
+	if opts.showRequest {
+		if loaded.request == nil {
+			return errors.New("--show-request requires -f URL or a request file")
+		}
+		printRequestSummary(stdout, *loaded.request, nil)
+		return nil
+	}
+	if opts.debugRequest && loaded.request != nil {
+		printRequestSummary(stderr, *loaded.request, loaded.response)
+	}
+	if opts.saveResponse != "" {
+		if loaded.request == nil {
+			return errors.New("--save-response requires -f URL or a request file")
+		}
+		if err := os.WriteFile(opts.saveResponse, loaded.data, 0o644); err != nil {
+			return err
+		}
+	}
+	data, source, err := applyRoot(loaded.data, loaded.source, opts.root)
 	if err != nil {
 		return err
 	}
 
-	ds, err := NewDataset(data, source)
+	ds, err := NewDatasetWithDelimiter(data, source, opts.delimiter)
 	if err != nil {
 		return err
 	}
@@ -249,6 +313,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 
 	if handled, err := runQueryCommand(ds, stdout, opts.query); handled {
 		return err
+	}
+	if query, ok, err := expandAggregateShortcutLine(opts.query); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		opts.query = query
 	}
 
 	result, err := ds.Query(context.Background(), opts.query)
@@ -272,7 +342,7 @@ func runQueryCommand(ds *Dataset, out io.Writer, query string) (bool, error) {
 	command, arg := splitCommand(strings.TrimSpace(query))
 	switch command {
 	case "ls", "schema", ".ls", ".schema":
-		printSchema(out, ds.Fields, ds.FieldLabels, arg)
+		printSchema(out, ds.Fields, ds.FieldLabels, ds.FieldTypes, ds.FieldSamples, arg)
 		return true, nil
 	case "preview", ".preview":
 		limit := "10"
@@ -290,27 +360,323 @@ func runQueryCommand(ds *Dataset, out io.Writer, query string) (bool, error) {
 	}
 }
 
+func runAggregateShortcut(ds *Dataset, command, arg string) (*QueryResult, error) {
+	query, err := aggregateShortcutQuery(command, arg)
+	if err != nil {
+		return nil, err
+	}
+	return ds.Query(context.Background(), query)
+}
+
+func expandAggregateShortcutLine(line string) (string, bool, error) {
+	line = strings.TrimSpace(line)
+	if query, ok, err := aggregateFunctionShortcutQuery(line); ok || err != nil {
+		return query, ok, err
+	}
+	command, arg := splitCommand(line)
+	if !isAggregateShortcut(command) {
+		return "", false, nil
+	}
+	query, err := aggregateShortcutQuery(command, arg)
+	return query, true, err
+}
+
+func aggregateShortcutQuery(command, arg string) (string, error) {
+	field, suffix := splitAggregateShortcutArg(arg)
+	if field == "" {
+		return "", fmt.Errorf("missing field; use %s FIELD", command)
+	}
+	alias := command
+	return fmt.Sprintf("select %s(number(%s)) as %s%s", command, field, alias, suffix), nil
+}
+
+func aggregateFunctionShortcutQuery(line string) (string, bool, error) {
+	nameEnd := strings.Index(line, "(")
+	if nameEnd <= 0 {
+		return "", false, nil
+	}
+	command := strings.ToLower(strings.TrimSpace(line[:nameEnd]))
+	if !isAggregateShortcut(command) {
+		return "", false, nil
+	}
+	closeParen := findMatchingParen(line, nameEnd)
+	if closeParen == -1 {
+		return "", true, fmt.Errorf("missing closing ) in %s shortcut", command)
+	}
+	field := strings.TrimSpace(line[nameEnd+1 : closeParen])
+	if field == "" {
+		return "", true, fmt.Errorf("missing field; use %s(FIELD)", command)
+	}
+	suffix := strings.TrimSpace(line[closeParen+1:])
+	if suffix != "" {
+		suffix = " " + suffix
+	}
+	return fmt.Sprintf("select %s(number(%s))%s", command, field, suffix), true, nil
+}
+
+func isAggregateShortcut(command string) bool {
+	switch command {
+	case "sum", "max", "min", "avg":
+		return true
+	default:
+		return false
+	}
+}
+
+func splitAggregateShortcutArg(arg string) (string, string) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return "", ""
+	}
+	index := findTopLevelKeyword(arg, "where")
+	if index == -1 {
+		return arg, ""
+	}
+	field := strings.TrimSpace(arg[:index])
+	suffix := strings.TrimSpace(arg[index:])
+	if suffix == "" {
+		return field, ""
+	}
+	return field, " " + suffix
+}
+
+func findMatchingParen(s string, open int) int {
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '\'', '"', '`':
+			i = skipQuoted(s, i, s[i]) - 1
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func findTopLevelKeyword(query, keyword string) int {
+	for i := 0; i < len(query); {
+		ch := query[i]
+		if ch == '\'' || ch == '"' || ch == '`' {
+			i = skipQuoted(query, i, ch)
+			continue
+		}
+		if isIdentStart(rune(ch)) {
+			end := i + 1
+			for end < len(query) && isIdentPart(rune(query[end])) {
+				end++
+			}
+			if strings.EqualFold(query[i:end], keyword) {
+				return i
+			}
+			i = end
+			continue
+		}
+		i++
+	}
+	return -1
+}
+
 func printVersion(out io.Writer) {
 	fmt.Fprintf(out, "jtv %s\n", version)
 }
 
-func readInput(args []string, stdin io.Reader, file string) ([]byte, string, error) {
+func printCLIUsage(out io.Writer, fs *flag.FlagSet) {
+	fmt.Fprintf(out, "jtv %s\n", version)
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Usage:")
+	fmt.Fprintln(out, "  jtv -f FILE [-q SQL] [--csv|--json|-o FILE]")
+	fmt.Fprintln(out, "  jtv -f URL [-q SQL] [--debug-request|--save-response FILE]")
+	fmt.Fprintln(out, "  cat data.json | jtv -q SQL")
+	fmt.Fprintln(out, "  jtv -f FILE")
+	fmt.Fprintln(out, "  jtv --stream -q SQL")
+	fmt.Fprintln(out, "  jtv --version")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Flags:")
+	fs.PrintDefaults()
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Input:")
+	fmt.Fprintln(out, "  JSON arrays, JSON objects/scalars, NDJSON/JSON Lines, and CSV are supported.")
+	fmt.Fprintln(out, "  CSV delimiters are auto-detected from comma, semicolon, pipe, and tab.")
+	fmt.Fprintln(out, "  Use --delimiter to force one delimiter, for example --delimiter '|' or --delimiter tab.")
+	fmt.Fprintln(out, "  Nested JSON fields are flattened into dot-path columns such as user.name.")
+	fmt.Fprintln(out, "  The input table is named input, but from input is optional for select queries.")
+	fmt.Fprintln(out, "  -f can read public HTTP(S) URLs directly.")
+	fmt.Fprintln(out, "  -f FILE can also read request files: curl, PowerShell Invoke-WebRequest, or raw HTTP.")
+	fmt.Fprintln(out, "  Request files are parsed and fetched by jtv; they are not executed as shell scripts.")
+	fmt.Fprintln(out, "  --root FIELD focuses a JSON response on a nested object or array.")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Query examples:")
+	fmt.Fprintln(out, `  -q "select * limit 10"`)
+	fmt.Fprintln(out, `  -f "https://example.test/api/users" -q "select *"`)
+	fmt.Fprintln(out, `  -q "select user.name, count(*) group by user.name"`)
+	fmt.Fprintln(out, `  -q "select status, count(*) as total group by status having total > 1"`)
+	fmt.Fprintln(out, `  -q "select rows.product where money(rows.price) > 10000"`)
+	fmt.Fprintln(out, `  -q "max(rows.price) as x where money(rows.price) > 10000"`)
+	fmt.Fprintln(out, `  -q "sum rows.price"`)
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Inspection commands:")
+	fmt.Fprintln(out, "  ls, schema          list detected fields")
+	fmt.Fprintln(out, "  ls TEXT -n 20       search fields and limit output")
+	fmt.Fprintln(out, "  preview [N]         show the first N rows")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Numeric helpers:")
+	fmt.Fprintln(out, "  int(value), float(value), number(value), money(value)")
+	fmt.Fprintln(out, "  sum FIELD, max FIELD, min FIELD, avg FIELD")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Interactive commands:")
+	fmt.Fprintln(out, "  help, next, prev, page N, pagesize N, csv FILE, json FILE, export FILE, clear, exit")
+	fmt.Fprintln(out, "  bar FIELD, top FIELD [N], hist FIELD, line X Y, chart bar SELECT ...")
+}
+
+type loadedInput struct {
+	data     []byte
+	source   string
+	request  *requestInput
+	response *requestResponseInfo
+}
+
+func readInput(args []string, stdin io.Reader, opts options) (loadedInput, error) {
 	if len(args) > 0 {
-		return nil, "", errors.New("input file must use -f")
+		return loadedInput{}, errors.New("input file must use -f")
 	}
-	if file == "-" {
+	if opts.file == "-" {
 		data, err := io.ReadAll(stdin)
-		return data, "stdin", err
+		if err != nil {
+			return loadedInput{}, err
+		}
+		return loadInputData(data, "stdin", opts)
 	}
-	if file == "" {
+	if opts.file == "" {
 		if isTerminal(stdin) {
-			return nil, "", errors.New("missing required -f input file")
+			return loadedInput{}, errors.New("missing required -f input file")
 		}
 		data, err := io.ReadAll(stdin)
-		return data, "stdin", err
+		if err != nil {
+			return loadedInput{}, err
+		}
+		return loadInputData(data, "stdin", opts)
 	}
-	data, err := os.ReadFile(file)
-	return data, file, err
+	if req, ok := directURLRequest(opts.file); ok {
+		return loadRequestInput(req, opts.file, opts)
+	}
+	data, err := os.ReadFile(opts.file)
+	if err != nil {
+		return loadedInput{}, err
+	}
+	return loadInputData(data, opts.file, opts)
+}
+
+func loadInputData(data []byte, source string, opts options) (loadedInput, error) {
+	req, ok, err := parseRequestInput(string(data))
+	if err != nil {
+		return loadedInput{}, err
+	}
+	if ok {
+		return loadRequestInput(req, source, opts)
+	}
+	return loadedInput{data: data, source: source}, nil
+}
+
+func loadRequestInput(req requestInput, source string, opts options) (loadedInput, error) {
+	applyConfiguredHeaders(&req, opts.configHeaders)
+	// Browser-copied request files often include br/zstd; jtv intentionally
+	// removes it so Go can negotiate/decode supported encodings itself.
+	req.headers.Del("Accept-Encoding")
+	loaded := loadedInput{source: redactURL(req.url), request: &req}
+	if opts.showRequest {
+		return loaded, nil
+	}
+	body, info, err := fetchRequestInput(req)
+	loaded.response = &info
+	if err != nil {
+		return loadedInput{}, fmt.Errorf("%s: %w", source, err)
+	}
+	loaded.data = body
+	return loaded, nil
+}
+
+func applyConfiguredHeaders(req *requestInput, configured map[string]map[string]string) {
+	if len(configured) == 0 {
+		return
+	}
+	u, err := url.Parse(req.url)
+	if err != nil {
+		return
+	}
+	host := strings.ToLower(u.Hostname())
+	for pattern, headers := range configured {
+		pattern = strings.ToLower(strings.TrimSpace(pattern))
+		if pattern != "*" && host != pattern && !strings.HasSuffix(host, "."+pattern) {
+			continue
+		}
+		for key, value := range headers {
+			if req.headers.Get(key) == "" {
+				req.headers.Set(key, value)
+			}
+		}
+	}
+}
+
+func printRequestSummary(out io.Writer, req requestInput, resp *requestResponseInfo) {
+	method := req.method
+	if method == "" {
+		method = "GET"
+	}
+	fmt.Fprintf(out, "%s %s\n", method, redactURL(req.url))
+	headers := requestHeaderNames(req.headers)
+	if len(headers) > 0 {
+		fmt.Fprintf(out, "headers: %s\n", strings.Join(headers, ", "))
+	} else {
+		fmt.Fprintln(out, "headers: (none)")
+	}
+	if req.body != "" {
+		fmt.Fprintf(out, "body: %d byte(s)\n", len(req.body))
+	}
+	if resp != nil {
+		fmt.Fprintf(out, "response: %s\n", resp.status)
+		fmt.Fprintf(out, "content-type: %s\n", resp.contentType)
+		fmt.Fprintf(out, "bytes: %d\n", resp.bytes)
+		if resp.preview != "" {
+			fmt.Fprintf(out, "preview: %s\n", resp.preview)
+		}
+	}
+}
+
+func applyRoot(data []byte, source, root string) ([]byte, string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return data, source, nil
+	}
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, "", fmt.Errorf("--root requires JSON input: %w", err)
+	}
+	current := value
+	for _, part := range strings.Split(root, ".") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, "", errors.New("--root path contains an empty segment")
+		}
+		object, ok := current.(map[string]any)
+		if !ok {
+			return nil, "", fmt.Errorf("--root %s: %s is not an object", root, part)
+		}
+		child, ok := object[part]
+		if !ok {
+			return nil, "", fmt.Errorf("--root %s: field %s not found", root, part)
+		}
+		current = child
+	}
+	out, err := json.Marshal(current)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, source + "#" + root, nil
 }
 
 func openStreamInput(args []string, stdin io.Reader, file string) (io.ReadCloser, error) {
@@ -330,6 +696,13 @@ func runStream(args []string, stdin io.Reader, stdout io.Writer, opts options) e
 	if opts.output != "" {
 		return errors.New("--stream does not support -o yet; redirect stdout instead")
 	}
+	query := opts.query
+	if expanded, ok, err := expandAggregateShortcutLine(query); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		query = expanded
+	}
 
 	input, err := openStreamInput(args, stdin, opts.file)
 	if err != nil {
@@ -347,12 +720,12 @@ func runStream(args []string, stdin io.Reader, stdout io.Writer, opts options) e
 		if line == "" {
 			continue
 		}
-		ds, err := NewDataset([]byte(line), fmt.Sprintf("stream:%d", lineNumber))
+		ds, err := NewDatasetWithDelimiter([]byte(line), fmt.Sprintf("stream:%d", lineNumber), opts.delimiter)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "stream line %d: %v\n", lineNumber, err)
 			continue
 		}
-		result, err := ds.Query(context.Background(), opts.query)
+		result, err := ds.Query(context.Background(), query)
 		ds.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "stream line %d: %v\n", lineNumber, err)
@@ -477,6 +850,17 @@ func runInteractive(ds *Dataset, stdin io.Reader, out io.Writer, pageSize int) e
 				fmt.Fprintln(out, "error:", err)
 			}
 			continue
+		case isAggregateShortcut(command):
+			result, err := runAggregateShortcut(ds, command, arg)
+			if err != nil {
+				fmt.Fprintln(out, "error:", err)
+				continue
+			}
+			history = appendHistory(history, line)
+			last = result
+			pager.active = false
+			printTable(out, result)
+			continue
 		case command == ".clear" || command == "clear":
 			clearScreen(out)
 			continue
@@ -484,7 +868,7 @@ func runInteractive(ds *Dataset, stdin io.Reader, out io.Writer, pageSize int) e
 			printHelp(out)
 			continue
 		case command == ".schema" || command == ".ls" || command == "schema" || command == "ls":
-			printSchema(out, ds.Fields, ds.FieldLabels, arg)
+			printSchema(out, ds.Fields, ds.FieldLabels, ds.FieldTypes, ds.FieldSamples, arg)
 			continue
 		case command == ".preview" || command == "preview":
 			query := "select * limit 10"
@@ -816,6 +1200,10 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  prev, p             show previous page")
 	fmt.Fprintln(out, "  page N              jump to page N")
 	fmt.Fprintln(out, "  pagesize N          set page size")
+	fmt.Fprintln(out, "  sum FIELD           sum numeric values")
+	fmt.Fprintln(out, "  max FIELD           show maximum numeric value")
+	fmt.Fprintln(out, "  min FIELD           show minimum numeric value")
+	fmt.Fprintln(out, "  avg FIELD           show average numeric value")
 	fmt.Fprintln(out, "  bar FIELD           count by FIELD as bar chart")
 	fmt.Fprintln(out, "  top FIELD [N]       top values by count")
 	fmt.Fprintln(out, "  hist FIELD          histogram for numeric FIELD")
@@ -834,6 +1222,8 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  select * limit 10")
 	fmt.Fprintln(out, "  select user.name, user.email limit 10")
 	fmt.Fprintln(out, "  select status, count(*) group by status")
+	fmt.Fprintln(out, "  sum rows.price")
+	fmt.Fprintln(out, "  max rows.price where int(rows.price) > 10000")
 	fmt.Fprintln(out, "  bar comments.likes")
 	fmt.Fprintln(out, "  top comments.user.username 10")
 	fmt.Fprintln(out, "  hist comments.likes")
@@ -846,9 +1236,14 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  chart bar select comments.user.username, count(*) as total group by comments.user.username order by total desc limit 10")
 }
 
-func printSchema(out io.Writer, fields []string, labels map[string]string, args string) {
+func printSchema(out io.Writer, fields []string, labels, types, samples map[string]string, args string) {
 	filter, limit := parseLSArgs(args)
-	matches := make([]string, 0, len(fields))
+	type schemaRow struct {
+		label  string
+		typ    string
+		sample string
+	}
+	matches := make([]schemaRow, 0, len(fields))
 	for _, field := range fields {
 		if field == "raw" {
 			continue
@@ -862,7 +1257,7 @@ func printSchema(out io.Writer, fields []string, labels map[string]string, args 
 			!strings.Contains(strings.ToLower(label), filter) {
 			continue
 		}
-		matches = append(matches, label)
+		matches = append(matches, schemaRow{label: label, typ: types[field], sample: samples[field]})
 	}
 
 	if filter == "" {
@@ -874,8 +1269,15 @@ func printSchema(out io.Writer, fields []string, labels map[string]string, args 
 	if limit > 0 && shown > limit {
 		shown = limit
 	}
-	for _, field := range matches[:shown] {
-		fmt.Fprintln(out, field)
+	labelWidth := len("field")
+	typeWidth := len("type")
+	for _, row := range matches[:shown] {
+		labelWidth = max(labelWidth, displayLen(row.label))
+		typeWidth = max(typeWidth, displayLen(row.typ))
+	}
+	fmt.Fprintf(out, "%-*s  %-*s  %s\n", labelWidth, "field", typeWidth, "type", "sample")
+	for _, row := range matches[:shown] {
+		fmt.Fprintf(out, "%-*s  %-*s  %s\n", labelWidth, row.label, typeWidth, row.typ, row.sample)
 	}
 	if len(matches) == 0 {
 		fmt.Fprintln(out, "(none)")
@@ -929,6 +1331,10 @@ func makeCompleter(fields []string) prompt.Completer {
 		{Text: "avg", Description: "aggregate average"},
 		{Text: "min", Description: "aggregate minimum"},
 		{Text: "max", Description: "aggregate maximum"},
+		{Text: "int", Description: "convert formatted number to integer"},
+		{Text: "float", Description: "convert formatted number to float"},
+		{Text: "number", Description: "convert formatted number"},
+		{Text: "money", Description: "convert formatted money"},
 		{Text: "ls", Description: "list fields"},
 		{Text: "schema", Description: "list fields"},
 		{Text: "preview", Description: "show rows"},
