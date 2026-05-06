@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"modernc.org/sqlite"
@@ -49,6 +51,8 @@ func init() {
 	registerNumericFunction("money", func(value float64) driver.Value {
 		return value
 	})
+	registerDateFunctions()
+	registerRegexFunctions()
 }
 
 func registerNumericFunction(name string, convert func(float64) driver.Value) {
@@ -58,6 +62,46 @@ func registerNumericFunction(name string, convert func(float64) driver.Value) {
 			return nil, err
 		}
 		return convert(value), nil
+	})
+}
+
+func registerDateFunctions() {
+	sqlite.MustRegisterDeterministicScalarFunction("date", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		t, err := dateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return t.Format("2006-01-02"), nil
+	})
+	sqlite.MustRegisterDeterministicScalarFunction("year", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		t, err := dateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Year()), nil
+	})
+	sqlite.MustRegisterDeterministicScalarFunction("month", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		t, err := dateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Month()), nil
+	})
+}
+
+func registerRegexFunctions() {
+	sqlite.MustRegisterDeterministicScalarFunction("regexp_like", 2, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		if len(args) != 2 || args[0] == nil || args[1] == nil {
+			return int64(0), nil
+		}
+		ok, err := regexp.MatchString(fmt.Sprint(args[1]), fmt.Sprint(args[0]))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return int64(1), nil
+		}
+		return int64(0), nil
 	})
 }
 
@@ -746,6 +790,50 @@ func parseFormattedNumber(value string) (float64, error) {
 
 func formattedNumberError(value string) error {
 	return fmt.Errorf("cannot convert %q to number; expected a value like 1000, 1.000, Rp 1.000, or 1.234,50", value)
+}
+
+func dateTimeValue(value any) (time.Time, error) {
+	switch v := value.(type) {
+	case nil:
+		return time.Time{}, fmt.Errorf("cannot convert null to date")
+	case time.Time:
+		return v, nil
+	case int64:
+		return time.Unix(v, 0), nil
+	case float64:
+		return time.Unix(int64(v), 0), nil
+	case []byte:
+		return parseDateTimeString(string(v))
+	default:
+		return parseDateTimeString(fmt.Sprint(v))
+	}
+}
+
+func parseDateTimeString(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, fmt.Errorf("cannot convert empty string to date")
+	}
+	if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return time.Unix(n, 0), nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+		"02/01/2006 15:04:05",
+		"02/01/2006",
+		"01/02/2006 15:04:05",
+		"01/02/2006",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot convert %q to date; expected ISO date/time, unix seconds, or common slash date", value)
 }
 
 func trimNumberSeparators(value string) string {

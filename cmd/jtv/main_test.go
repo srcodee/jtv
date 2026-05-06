@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -225,7 +226,7 @@ func TestRunVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
 	}
-	if stdout.String() != "jtv 0.1.4\n" {
+	if stdout.String() != "jtv 0.1.5\n" {
 		t.Fatalf("stdout = %q, want version", stdout.String())
 	}
 }
@@ -240,7 +241,7 @@ func TestRunHelp(t *testing.T) {
 	}
 	help := stderr.String()
 	for _, want := range []string{
-		"jtv 0.1.4",
+		"jtv 0.1.5",
 		"Usage:",
 		"jtv --version",
 		"Input:",
@@ -250,6 +251,7 @@ func TestRunHelp(t *testing.T) {
 		`max(rows.price) as x where money(rows.price) > 10000`,
 		"Numeric helpers:",
 		"sum FIELD, max FIELD, min FIELD, avg FIELD",
+		"date(value), year(value), month(value), regexp_like(value, pattern)",
 		"Interactive commands:",
 	} {
 		if !strings.Contains(help, want) {
@@ -559,6 +561,73 @@ func TestRunDelimiterFlag(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Ana") {
 		t.Fatalf("stdout = %q, want Ana", stdout.String())
+	}
+}
+
+func TestRunURLWithMethodHeaderAndData(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"method":%q,"auth":%q,"body":%q}`, r.Method, r.Header.Get("Authorization"), string(body))
+	}))
+	t.Cleanup(server.Close)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{
+		"-f", server.URL,
+		"--method", "patch",
+		"--header", "Authorization: Bearer token",
+		"--data", `{"ok":true}`,
+		"-q", "select method, auth, body",
+	}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "PATCH") || !strings.Contains(got, "Bearer token") || !strings.Contains(got, `{"ok":true}`) {
+		t.Fatalf("stdout = %q, want method/header/body echo", got)
+	}
+}
+
+func TestRunMarkdownOutput(t *testing.T) {
+	stdin := strings.NewReader(`[{"id":1,"name":"Ana|A"}]`)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-f", "-", "--md", "-q", "select id, name"}, stdin, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+	}
+	want := "| id | name |\n| --- | --- |\n| 1 | Ana\\|A |\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+func TestRunQueryAliases(t *testing.T) {
+	cases := []struct {
+		query string
+		want  string
+	}{
+		{"fields status", "status"},
+		{"head 1", "1 row(s)"},
+		{"uniq status", "fail"},
+		{"count status", "2"},
+		{"count", "3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			err := run([]string{"-f", "-", "-q", tc.query}, strings.NewReader(`[{"status":"ok"},{"status":"ok"},{"status":"fail"}]`), &stdout, &stderr)
+			if err != nil {
+				t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), tc.want) {
+				t.Fatalf("stdout = %q, want %q", stdout.String(), tc.want)
+			}
+		})
 	}
 }
 

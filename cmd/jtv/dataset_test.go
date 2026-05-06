@@ -204,6 +204,43 @@ func TestQueryFormattedNumberErrorIsHelpful(t *testing.T) {
 	}
 }
 
+func TestQueryDateTimeHelpers(t *testing.T) {
+	data := []byte(`[
+		{"created_at":"2026-05-06T15:04:05Z"},
+		{"created_at":"2025-12-31 10:20:30"}
+	]`)
+
+	ds, err := NewDataset(data, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	result, err := ds.Query(context.Background(), "select date(created_at) as day, year(created_at) as year, month(created_at) as month order by day desc limit 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(result.Rows[0], ","); got != "2026-05-06,2026,5" {
+		t.Fatalf("row = %q, want 2026-05-06,2026,5", got)
+	}
+}
+
+func TestQueryRegexpLike(t *testing.T) {
+	ds, err := NewDataset([]byte(`[{"name":"Ana"},{"name":"Budi"}]`), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	result, err := ds.Query(context.Background(), "select name where regexp_like(name, '^A')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "Ana" {
+		t.Fatalf("rows = %v, want Ana", result.Rows)
+	}
+}
+
 func TestQueryCaseInsensitiveFields(t *testing.T) {
 	data := []byte(`ID,Status,User Name
 1,ok,Ana

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,16 +23,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const version = "0.1.4"
+const version = "0.1.5"
 
 type options struct {
 	file          string
 	query         string
 	output        string
 	delimiter     string
+	method        string
+	data          string
+	headers       repeatedStrings
 	configPath    string
 	csv           bool
 	json          bool
+	md            bool
 	stream        bool
 	debugRequest  bool
 	showRequest   bool
@@ -224,6 +229,24 @@ func resolveOutputFlagOverrides(fs *flag.FlagSet, opts *options) {
 	if visited["json"] && !visited["csv"] {
 		opts.csv = false
 	}
+	if visited["csv"] || visited["json"] {
+		opts.md = false
+	}
+	if visited["md"] {
+		opts.csv = false
+		opts.json = false
+	}
+}
+
+type repeatedStrings []string
+
+func (r *repeatedStrings) String() string {
+	return strings.Join(*r, ",")
+}
+
+func (r *repeatedStrings) Set(value string) error {
+	*r = append(*r, value)
+	return nil
 }
 
 func main() {
@@ -244,11 +267,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.query, "q", "", "SQL query to execute")
 	fs.StringVar(&opts.output, "o", "", "write output to file; format is inferred from extension")
 	fs.StringVar(&opts.delimiter, "delimiter", "", "CSV delimiter: auto, comma, semicolon, pipe, tab, or one character")
+	fs.StringVar(&opts.method, "method", "", "HTTP method for -f URL or request file")
+	fs.StringVar(&opts.data, "data", "", "HTTP request body for -f URL or request file")
+	fs.Var(&opts.headers, "header", "HTTP header for -f URL or request file; can be repeated")
 	fs.StringVar(&opts.root, "root", "", "use a JSON field as the dataset root")
 	fs.StringVar(&opts.saveResponse, "save-response", "", "write fetched HTTP response body to file")
 	fs.StringVar(&opts.configPath, "config", opts.configPath, "config file path")
 	fs.BoolVar(&opts.csv, "csv", opts.csv, "write query result as CSV")
 	fs.BoolVar(&opts.json, "json", opts.json, "write query result as JSON")
+	fs.BoolVar(&opts.md, "md", opts.md, "write query result as Markdown")
 	fs.BoolVar(&opts.stream, "stream", false, "read NDJSON continuously and run query for each line")
 	fs.BoolVar(&opts.debugRequest, "debug-request", false, "print safe HTTP request/response debug info")
 	fs.BoolVar(&opts.showRequest, "show-request", false, "print parsed HTTP request without fetching it")
@@ -334,6 +361,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if opts.csv {
 		return writeCSV(stdout, result)
 	}
+	if opts.md {
+		return writeMarkdown(stdout, result)
+	}
 	printTable(stdout, result)
 	return nil
 }
@@ -341,10 +371,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 func runQueryCommand(ds *Dataset, out io.Writer, query string) (bool, error) {
 	command, arg := splitCommand(strings.TrimSpace(query))
 	switch command {
-	case "ls", "schema", ".ls", ".schema":
+	case "ls", "schema", "fields", ".ls", ".schema", ".fields":
 		printSchema(out, ds.Fields, ds.FieldLabels, ds.FieldTypes, ds.FieldSamples, arg)
 		return true, nil
-	case "preview", ".preview":
+	case "preview", "head", ".preview", ".head":
 		limit := "10"
 		if arg != "" {
 			limit = arg
@@ -355,9 +385,47 @@ func runQueryCommand(ds *Dataset, out io.Writer, query string) (bool, error) {
 		}
 		printTable(out, result)
 		return true, nil
+	case "uniq":
+		query, err := uniqShortcutQuery(arg)
+		if err != nil {
+			return true, err
+		}
+		result, err := ds.Query(context.Background(), query)
+		if err != nil {
+			return true, err
+		}
+		printTable(out, result)
+		return true, nil
+	case "count":
+		query, err := countShortcutQuery(arg)
+		if err != nil {
+			return true, err
+		}
+		result, err := ds.Query(context.Background(), query)
+		if err != nil {
+			return true, err
+		}
+		printTable(out, result)
+		return true, nil
 	default:
 		return false, nil
 	}
+}
+
+func uniqShortcutQuery(arg string) (string, error) {
+	field := strings.TrimSpace(arg)
+	if field == "" {
+		return "", errors.New("missing field; use uniq FIELD")
+	}
+	return fmt.Sprintf("select distinct %s order by %s", field, field), nil
+}
+
+func countShortcutQuery(arg string) (string, error) {
+	field := strings.TrimSpace(arg)
+	if field == "" {
+		return "select count(*) as total", nil
+	}
+	return fmt.Sprintf("select %s, count(*) as total group by %s order by total desc", field, field), nil
 }
 
 func runAggregateShortcut(ds *Dataset, command, arg string) (*QueryResult, error) {
@@ -513,6 +581,9 @@ func printCLIUsage(out io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(out, "Query examples:")
 	fmt.Fprintln(out, `  -q "select * limit 10"`)
 	fmt.Fprintln(out, `  -f "https://example.test/api/users" -q "select *"`)
+	fmt.Fprintln(out, `  -f "https://example.test/api/users" --header "Authorization: Bearer ..." -q "select *"`)
+	fmt.Fprintln(out, `  -q "select date(created_at), year(created_at), month(created_at)"`)
+	fmt.Fprintln(out, `  -q "select * where regexp_like(name, '^Ana')"`)
 	fmt.Fprintln(out, `  -q "select user.name, count(*) group by user.name"`)
 	fmt.Fprintln(out, `  -q "select status, count(*) as total group by status having total > 1"`)
 	fmt.Fprintln(out, `  -q "select rows.product where money(rows.price) > 10000"`)
@@ -520,13 +591,15 @@ func printCLIUsage(out io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(out, `  -q "sum rows.price"`)
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Inspection commands:")
-	fmt.Fprintln(out, "  ls, schema          list detected fields")
+	fmt.Fprintln(out, "  ls, schema, fields  list detected fields")
 	fmt.Fprintln(out, "  ls TEXT -n 20       search fields and limit output")
-	fmt.Fprintln(out, "  preview [N]         show the first N rows")
+	fmt.Fprintln(out, "  preview/head [N]    show the first N rows")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Numeric helpers:")
 	fmt.Fprintln(out, "  int(value), float(value), number(value), money(value)")
 	fmt.Fprintln(out, "  sum FIELD, max FIELD, min FIELD, avg FIELD")
+	fmt.Fprintln(out, "  uniq FIELD, count [FIELD]")
+	fmt.Fprintln(out, "  date(value), year(value), month(value), regexp_like(value, pattern)")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Interactive commands:")
 	fmt.Fprintln(out, "  help, next, prev, page N, pagesize N, csv FILE, json FILE, export FILE, clear, exit")
@@ -583,6 +656,7 @@ func loadInputData(data []byte, source string, opts options) (loadedInput, error
 }
 
 func loadRequestInput(req requestInput, source string, opts options) (loadedInput, error) {
+	applyCLIRequestOptions(&req, opts)
 	applyConfiguredHeaders(&req, opts.configHeaders)
 	// Browser-copied request files often include br/zstd; jtv intentionally
 	// removes it so Go can negotiate/decode supported encodings itself.
@@ -598,6 +672,21 @@ func loadRequestInput(req requestInput, source string, opts options) (loadedInpu
 	}
 	loaded.data = body
 	return loaded, nil
+}
+
+func applyCLIRequestOptions(req *requestInput, opts options) {
+	if opts.method != "" {
+		req.method = strings.ToUpper(opts.method)
+	}
+	if opts.data != "" {
+		req.body = opts.data
+		if req.method == "" || req.method == http.MethodGet {
+			req.method = http.MethodPost
+		}
+	}
+	for _, header := range opts.headers {
+		addHeaderLine(req.headers, header)
+	}
 }
 
 func applyConfiguredHeaders(req *requestInput, configured map[string]map[string]string) {
@@ -867,10 +956,10 @@ func runInteractive(ds *Dataset, stdin io.Reader, out io.Writer, pageSize int) e
 		case command == ".help" || command == "help":
 			printHelp(out)
 			continue
-		case command == ".schema" || command == ".ls" || command == "schema" || command == "ls":
+		case command == ".schema" || command == ".ls" || command == ".fields" || command == "schema" || command == "ls" || command == "fields":
 			printSchema(out, ds.Fields, ds.FieldLabels, ds.FieldTypes, ds.FieldSamples, arg)
 			continue
-		case command == ".preview" || command == "preview":
+		case command == ".preview" || command == ".head" || command == "preview" || command == "head":
 			query := "select * limit 10"
 			if arg != "" {
 				query = "select * limit " + arg
@@ -882,7 +971,29 @@ func runInteractive(ds *Dataset, stdin io.Reader, out io.Writer, pageSize int) e
 			}
 			printTable(out, result)
 			continue
-		case command == ".csv" || command == "csv" || command == ".json" || command == "json" || command == "export":
+		case command == "uniq" || command == "count":
+			var query string
+			var err error
+			if command == "uniq" {
+				query, err = uniqShortcutQuery(arg)
+			} else {
+				query, err = countShortcutQuery(arg)
+			}
+			if err != nil {
+				fmt.Fprintln(out, "error:", err)
+				continue
+			}
+			result, err := ds.Query(context.Background(), query)
+			if err != nil {
+				fmt.Fprintln(out, "error:", err)
+				continue
+			}
+			history = appendHistory(history, line)
+			last = result
+			pager.active = false
+			printTable(out, result)
+			continue
+		case command == ".csv" || command == "csv" || command == ".json" || command == "json" || command == ".md" || command == "md" || command == "export":
 			if last == nil {
 				fmt.Fprintln(out, "error: no previous query result")
 				continue
@@ -1196,6 +1307,10 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  ls TEXT             search detected fields")
 	fmt.Fprintln(out, "  ls TEXT -n 20       search and limit fields")
 	fmt.Fprintln(out, "  preview [N]         show the first N rows")
+	fmt.Fprintln(out, "  head [N]            alias for preview")
+	fmt.Fprintln(out, "  fields              alias for schema")
+	fmt.Fprintln(out, "  uniq FIELD          distinct values")
+	fmt.Fprintln(out, "  count [FIELD]       count rows or count by field")
 	fmt.Fprintln(out, "  next, n             show next page")
 	fmt.Fprintln(out, "  prev, p             show previous page")
 	fmt.Fprintln(out, "  page N              jump to page N")
@@ -1214,6 +1329,7 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  chart bar SELECT    same as bar SELECT")
 	fmt.Fprintln(out, "  csv FILE            export the last query result to CSV")
 	fmt.Fprintln(out, "  json FILE           export the last query result to JSON")
+	fmt.Fprintln(out, "  md FILE             export the last query result to Markdown")
 	fmt.Fprintln(out, "  export FILE         export by file extension: .csv or .json")
 	fmt.Fprintln(out, "  clear               clear the screen")
 	fmt.Fprintln(out, "  exit, quit          exit")
@@ -1222,6 +1338,10 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  select * limit 10")
 	fmt.Fprintln(out, "  select user.name, user.email limit 10")
 	fmt.Fprintln(out, "  select status, count(*) group by status")
+	fmt.Fprintln(out, "  uniq status")
+	fmt.Fprintln(out, "  count status")
+	fmt.Fprintln(out, "  select date(created_at), year(created_at), month(created_at)")
+	fmt.Fprintln(out, "  select * where regexp_like(name, '^Ana')")
 	fmt.Fprintln(out, "  sum rows.price")
 	fmt.Fprintln(out, "  max rows.price where int(rows.price) > 10000")
 	fmt.Fprintln(out, "  bar comments.likes")
@@ -1335,9 +1455,17 @@ func makeCompleter(fields []string) prompt.Completer {
 		{Text: "float", Description: "convert formatted number to float"},
 		{Text: "number", Description: "convert formatted number"},
 		{Text: "money", Description: "convert formatted money"},
+		{Text: "date", Description: "extract date"},
+		{Text: "year", Description: "extract year"},
+		{Text: "month", Description: "extract month"},
+		{Text: "regexp_like", Description: "regex match"},
+		{Text: "uniq", Description: "distinct values"},
+		{Text: "count", Description: "count rows or values"},
 		{Text: "ls", Description: "list fields"},
 		{Text: "schema", Description: "list fields"},
+		{Text: "fields", Description: "list fields"},
 		{Text: "preview", Description: "show rows"},
+		{Text: "head", Description: "show rows"},
 		{Text: "next", Description: "next page"},
 		{Text: "n", Description: "next page"},
 		{Text: "prev", Description: "previous page"},
@@ -1351,13 +1479,17 @@ func makeCompleter(fields []string) prompt.Completer {
 		{Text: "chart", Description: "chart command"},
 		{Text: "csv", Description: "export last result"},
 		{Text: "json", Description: "export last result"},
+		{Text: "md", Description: "export last result"},
 		{Text: "export", Description: "export last result"},
 		{Text: "help", Description: "show help"},
 		{Text: ".schema", Description: "show detected fields"},
 		{Text: ".ls", Description: "list fields"},
 		{Text: ".preview", Description: "show sample rows"},
+		{Text: ".head", Description: "show sample rows"},
+		{Text: ".fields", Description: "show detected fields"},
 		{Text: ".csv", Description: "export last result"},
 		{Text: ".json", Description: "export last result"},
+		{Text: ".md", Description: "export last result"},
 		{Text: ".clear", Description: "clear screen"},
 		{Text: "clear", Description: "clear screen"},
 		{Text: ".quit", Description: "exit"},
@@ -1379,6 +1511,8 @@ func writeInteractiveExport(command, path string, result *QueryResult) error {
 		return writeCSVFile(path, result)
 	case "json", ".json":
 		return writeJSONFile(path, result)
+	case "md", ".md":
+		return writeMarkdownFile(path, result)
 	default:
 		return writeResultFile(path, result)
 	}
@@ -1388,10 +1522,12 @@ func writeResultFile(path string, result *QueryResult) error {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".json":
 		return writeJSONFile(path, result)
+	case ".md", ".markdown":
+		return writeMarkdownFile(path, result)
 	case ".csv", "":
 		return writeCSVFile(path, result)
 	default:
-		return fmt.Errorf("unsupported output extension %q; use .csv or .json", filepath.Ext(path))
+		return fmt.Errorf("unsupported output extension %q; use .csv, .json, or .md", filepath.Ext(path))
 	}
 }
 
@@ -1413,6 +1549,15 @@ func writeJSONFile(path string, result *QueryResult) error {
 	return writeJSON(file, result)
 }
 
+func writeMarkdownFile(path string, result *QueryResult) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return writeMarkdown(file, result)
+}
+
 func writeCSV(w io.Writer, result *QueryResult) error {
 	writer := csv.NewWriter(w)
 	if err := writer.Write(result.Columns); err != nil {
@@ -1431,6 +1576,39 @@ func writeJSON(w io.Writer, result *QueryResult) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(resultRowsAsObjects(result))
+}
+
+func writeMarkdown(w io.Writer, result *QueryResult) error {
+	if len(result.Columns) == 0 {
+		return nil
+	}
+	writeMarkdownRow(w, result.Columns)
+	separator := make([]string, len(result.Columns))
+	for i := range separator {
+		separator[i] = "---"
+	}
+	writeMarkdownRow(w, separator)
+	for _, row := range result.Rows {
+		writeMarkdownRow(w, row)
+	}
+	return nil
+}
+
+func writeMarkdownRow(w io.Writer, row []string) {
+	fmt.Fprint(w, "|")
+	for _, cell := range row {
+		fmt.Fprintf(w, " %s |", markdownCell(cell))
+	}
+	fmt.Fprintln(w)
+}
+
+func markdownCell(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, "|", `\|`)
+	value = strings.ReplaceAll(value, "\r\n", "<br>")
+	value = strings.ReplaceAll(value, "\n", "<br>")
+	value = strings.ReplaceAll(value, "\r", "<br>")
+	return value
 }
 
 func jsonValue(value any) any {
@@ -1465,6 +1643,9 @@ func (w *streamWriter) Write(result *QueryResult) error {
 	}
 	if w.opts.csv {
 		return w.writeCSVRows(result)
+	}
+	if w.opts.md {
+		return writeMarkdown(w.out, result)
 	}
 	return w.writeTableRows(result)
 }

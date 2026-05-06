@@ -33,14 +33,17 @@ go build -buildvcs=false -o jtv ./cmd/jtv
 cat data.json | ./jtv
 ./jtv -f data.json -q "select *"
 ./jtv -f https://example.test/api/users -q "select id, user.name"
+./jtv -f https://example.test/api/users --header "Authorization: Bearer ..." -q "select id, user.name"
 ./jtv -f data.json -q "select user.name, count(*) group by user.name"
 cat data.ndjson | ./jtv -q "select status, count(*) group by status"
 curl -s https://dummyjson.com/comments | ./jtv
 tail -f ok.txt | ./jtv --stream -q "select time, status, duration_s, db_count"
 ./jtv -f data.json -q "select user.name, order.total" --csv
 ./jtv -f data.json -q "select user.name, order.total" --json
+./jtv -f data.json -q "select user.name, order.total" --md
 ./jtv -f data.json -q "select user.name, order.total" -o result.csv
 ./jtv -f data.json -q "select user.name, order.total" -o result.json
+./jtv -f data.json -q "select user.name, order.total" -o result.md
 ./jtv --version
 ```
 
@@ -54,7 +57,14 @@ Without `-q`, `jtv` starts an interactive prompt with SQL autocomplete.
 ```text
 -f FILE     input JSON, NDJSON, or CSV file; use - for stdin
 -q SQL      SQL query to execute
--o FILE     write query output to file; .csv and .json are supported
+-o FILE     write query output to file; .csv, .json, and .md are supported
+--md        write query output as Markdown
+--method METHOD
+            HTTP method for -f URL or request file
+--header HEADER
+            HTTP header for -f URL or request file; can be repeated
+--data BODY
+            HTTP request body for -f URL or request file
 --delimiter DELIM
             CSV delimiter: auto, comma, semicolon, pipe, tab, or one character
 --root FIELD
@@ -76,7 +86,7 @@ Without `-q`, `jtv` starts an interactive prompt with SQL autocomplete.
 
 If no output flag is set, results are printed as an ASCII table. With `-o`, the
 format is inferred from the file extension. An empty or `.csv` extension writes
-CSV; `.json` writes JSON.
+CSV; `.json` writes JSON; `.md` writes Markdown.
 
 `--csv` and `--json` override the configured default output format for a single
 command.
@@ -156,6 +166,7 @@ Request helpers:
 ./jtv -f request.txt --debug-request -q "select * limit 1"
 ./jtv -f request.txt --save-response response.json -q "select status"
 ./jtv -f response.json -q "select status"
+./jtv -f https://example.test/api/users --method POST --header "Authorization: Bearer ..." --data '{"active":true}' -q "select id"
 ```
 
 `--show-request` and `--debug-request` redact sensitive header names such as
@@ -225,7 +236,7 @@ bar SELECT ...        bar chart from SQL label/value columns
 chart bar SELECT ...  same as bar SELECT ...
 csv FILE              export the last query result to CSV
 json FILE             export the last query result to JSON
-export FILE           export by extension: .csv or .json
+export FILE           export by extension: .csv, .json, or .md
 clear                 clear the screen
 exit, quit            exit
 ```
@@ -235,7 +246,7 @@ The default page size is 10. Use `next`, `prev`, `page N`, and `pagesize N` to
 navigate results. Query history is available through the up/down arrow keys
 when autocomplete is available.
 
-Dot commands such as `.help`, `.ls`, `.schema`, `.preview`, `.csv`, `.json`,
+Dot commands such as `.help`, `.ls`, `.schema`, `.preview`, `.csv`, `.json`, `.md`,
 `.clear`, `.exit`, and `.quit` are also supported.
 
 ## Query Model
@@ -303,6 +314,20 @@ int(value)     convert formatted text to an integer
 float(value)   convert formatted text to a decimal number
 number(value)  convert formatted text to a decimal number
 money(value)   alias for number(value), useful for currency strings
+date(value)    normalize a date/time to YYYY-MM-DD
+year(value)    extract the year from a date/time
+month(value)   extract the month number from a date/time
+regexp_like(value, pattern)
+              return 1 when value matches a regular expression
+```
+
+Shortcut query commands are available in `-q` and interactive mode:
+
+```text
+fields         alias for schema
+head [N]       alias for preview [N]
+uniq FIELD     distinct values
+count [FIELD]  count rows, or count rows by FIELD
 ```
 
 If a query references a field that does not exist, `jtv` suggests the nearest
@@ -377,8 +402,10 @@ Export results:
 ```bash
 ./jtv -f examples/users.json -q "select id, user.name, status" --csv
 ./jtv -f examples/users.json -q "select id, user.name, status" --json
+./jtv -f examples/users.json -q "select id, user.name, status" --md
 ./jtv -f examples/users.json -q "select id, user.name, status" -o users.csv
 ./jtv -f examples/users.json -q "select id, user.name, status" -o users.json
+./jtv -f examples/users.json -q "select id, user.name, status" -o users.md
 ```
 
 Explore interactively:
