@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"database/sql/driver"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +14,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"modernc.org/sqlite"
 )
 
 type Dataset struct {
@@ -30,6 +26,89 @@ type Dataset struct {
 	RowCount     int
 
 	db *sql.DB
+	// textFields holds the lower-cased names of text columns, whose values
+	// are compared as strings even when the query uses a numeric literal.
+	textFields map[string]bool
+	// stream is set when the database belongs to a stream session.
+	stream *streamSession
+	// keyTables maps lower-cased field names of a cached dataset to their
+	// sorted key tables, "" while not built yet (see key_lookup.go).
+	keyTables map[string]string
+	// keyCandidates are the columns that qualify for key tables.
+	keyCandidates map[string]keyColumn
+	// cacheFile is the cache database a cached dataset was opened from.
+	cacheFile string
+	// afterQuery runs once the current query has finished.
+	afterQuery []func()
+	// csv marks datasets loaded from delimited text; headerless ones had no
+	// header row and got generated column names.
+	csv        bool
+	headerless bool
+	// columnNames maps original field names to the names shown instead
+	// (see column_names.go); base keeps the metadata under original names.
+	columnNames map[string]string
+	base        *baseFields
+	// namesPath is the local file whose saved column names apply.
+	namesPath string
+	// tempDB is a temporary on-disk database holding a file too big to
+	// load in memory, deleted on Close.
+	tempDB string
+	// streamBatch marks a --stream batch: many input lines answered as one,
+	// each still a single row, so no automatic de-duplication across them.
+	streamBatch bool
+}
+
+// streamSession reuses one database for every line of --stream input:
+// opening DuckDB costs about 30ms and creating tables a few more, against
+// well under a millisecond to replace the rows of an unchanged table.
+type streamSession struct {
+	db *sql.DB
+	// schema is the column definition of the current jtv_data table.
+	schema string
+	// statements caches prepared statements for the current schema.
+	statements map[string]*sql.Stmt
+}
+
+func newStreamSession() (*streamSession, error) {
+	db, err := openDuckDB()
+	if err != nil {
+		return nil, err
+	}
+	// Each line is one row; worker threads only add scheduling overhead.
+	if _, err := db.Exec("set threads = 1"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &streamSession{db: db}, nil
+}
+
+func (s *streamSession) prepare(query string) (*sql.Stmt, error) {
+	if stmt, ok := s.statements[query]; ok {
+		return stmt, nil
+	}
+	stmt, err := s.db.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	if s.statements == nil {
+		s.statements = map[string]*sql.Stmt{}
+	}
+	s.statements[query] = stmt
+	return stmt, nil
+}
+
+// resetStatements drops prepared statements, which DuckDB invalidates when
+// the table they read is replaced.
+func (s *streamSession) resetStatements() {
+	for _, stmt := range s.statements {
+		stmt.Close()
+	}
+	s.statements = nil
+}
+
+func (s *streamSession) Close() error {
+	s.resetStatements()
+	return s.db.Close()
 }
 
 type QueryResult struct {
@@ -38,81 +117,30 @@ type QueryResult struct {
 	Values  [][]any
 }
 
-func init() {
-	registerNumericFunction("int", func(value float64) driver.Value {
-		return int64(value)
-	})
-	registerNumericFunction("float", func(value float64) driver.Value {
-		return value
-	})
-	registerNumericFunction("number", func(value float64) driver.Value {
-		return value
-	})
-	registerNumericFunction("money", func(value float64) driver.Value {
-		return value
-	})
-	registerDateFunctions()
-	registerRegexFunctions()
-}
-
-func registerNumericFunction(name string, convert func(float64) driver.Value) {
-	sqlite.MustRegisterDeterministicScalarFunction(name, 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-		value, err := numericValue(args[0])
-		if err != nil {
-			return nil, err
-		}
-		return convert(value), nil
-	})
-}
-
-func registerDateFunctions() {
-	sqlite.MustRegisterDeterministicScalarFunction("date", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-		t, err := dateTimeValue(args[0])
-		if err != nil {
-			return nil, err
-		}
-		return t.Format("2006-01-02"), nil
-	})
-	sqlite.MustRegisterDeterministicScalarFunction("year", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-		t, err := dateTimeValue(args[0])
-		if err != nil {
-			return nil, err
-		}
-		return int64(t.Year()), nil
-	})
-	sqlite.MustRegisterDeterministicScalarFunction("month", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-		t, err := dateTimeValue(args[0])
-		if err != nil {
-			return nil, err
-		}
-		return int64(t.Month()), nil
-	})
-}
-
-func registerRegexFunctions() {
-	sqlite.MustRegisterDeterministicScalarFunction("regexp_like", 2, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-		if len(args) != 2 || args[0] == nil || args[1] == nil {
-			return int64(0), nil
-		}
-		ok, err := regexp.MatchString(fmt.Sprint(args[1]), fmt.Sprint(args[0]))
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return int64(1), nil
-		}
-		return int64(0), nil
-	})
-}
-
 func NewDataset(data []byte, source string) (*Dataset, error) {
 	return NewDatasetWithDelimiter(data, source, "")
 }
 
 func NewDatasetWithDelimiter(data []byte, source, delimiter string) (*Dataset, error) {
-	rows, err := parseRows(data, delimiter)
-	if err != nil {
-		return nil, err
+	return NewDatasetFromInput(data, "", source, delimiter)
+}
+
+// NewDatasetFromInput loads JSON or delimited input. path, when set, is a
+// local file holding exactly data; CSV input is then read from it directly.
+func NewDatasetFromInput(data []byte, path, source, delimiter string) (*Dataset, error) {
+	return newDataset(data, path, source, delimiter, nil)
+}
+
+// newDataset loads input into the stream session's database when stream is
+// set and the input is JSON; otherwise the dataset gets a database of its own.
+func newDataset(data []byte, path, source, delimiter string, stream *streamSession) (*Dataset, error) {
+	rows, jsonErr := parseJSONRows(data)
+	if jsonErr != nil {
+		ds, csvErr := newCSVDataset(data, path, source, delimiter)
+		if csvErr != nil {
+			return nil, fmt.Errorf("%w; CSV fallback failed: %w", jsonErr, csvErr)
+		}
+		return ds, nil
 	}
 	if len(rows) == 0 {
 		return nil, errors.New("input contains no rows")
@@ -137,9 +165,14 @@ func NewDatasetWithDelimiter(data []byte, source, delimiter string) (*Dataset, e
 	labels := buildFieldLabels(fields, arrayPaths)
 	fieldTypes, fieldSamples := buildFieldExamples(fields, flatRows)
 	arrayFields := buildArrayFields(fields, arrayPaths)
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		return nil, err
+	var db *sql.DB
+	if stream != nil {
+		db = stream.db
+	} else {
+		var err error
+		if db, err = openDuckDB(); err != nil {
+			return nil, err
+		}
 	}
 
 	ds := &Dataset{
@@ -151,85 +184,149 @@ func NewDatasetWithDelimiter(data []byte, source, delimiter string) (*Dataset, e
 		ArrayFields:  arrayFields,
 		RowCount:     len(flatRows),
 		db:           db,
+		stream:       stream,
 	}
 	if err := ds.load(flatRows); err != nil {
-		db.Close()
+		ds.Close()
 		return nil, err
 	}
 	return ds, nil
 }
 
-func (d *Dataset) Close() error {
-	return d.db.Close()
-}
-
-func (d *Dataset) Query(ctx context.Context, query string) (*QueryResult, error) {
-	query = d.applyQueryDefaults(query)
-	rewritten := rewriteQuery(query, d.Fields)
-	rows, err := d.db.QueryContext(ctx, rewritten)
-	if err != nil {
-		return nil, enrichQueryError(err, d.Fields)
+// queryContext runs a query, through the stream session's prepared
+// statements when there is one: --stream repeats the same query for every
+// line, and preparing it once halves DuckDB's per-query cost.
+func (d *Dataset) queryContext(ctx context.Context, query string) (*sql.Rows, error) {
+	if d.stream == nil {
+		return d.db.QueryContext(ctx, query)
 	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
+	stmt, err := d.stream.prepare(query)
 	if err != nil {
 		return nil, err
 	}
+	return stmt.QueryContext(ctx)
+}
 
-	result := &QueryResult{Columns: normalizeResultColumns(cols)}
-	for rows.Next() {
-		values := make([]any, len(cols))
-		dest := make([]any, len(cols))
-		for i := range values {
-			dest[i] = &values[i]
-		}
-		if err := rows.Scan(dest...); err != nil {
-			return nil, err
-		}
-		result.Values = append(result.Values, cloneValues(values))
-		result.Rows = append(result.Rows, stringifyRow(values))
+func (d *Dataset) Close() error {
+	if d.stream != nil {
+		return nil // owned by the stream session
 	}
-	return result, rows.Err()
+	err := d.db.Close()
+	removeLoadDB(d.tempDB)
+	return err
+}
+
+func (d *Dataset) Query(ctx context.Context, query string) (*QueryResult, error) {
+	result := &QueryResult{}
+	err := d.QueryEach(ctx, query, func(columns []string) error {
+		result.Columns = columns
+		return nil
+	}, func(row []string, values []any) error {
+		result.Rows = append(result.Rows, row)
+		result.Values = append(result.Values, values)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// QueryEach runs a query and hands over the columns, then each row as it is
+// read, so callers can write results of any size without holding them all.
+// values is owned by the callback.
+func (d *Dataset) QueryEach(ctx context.Context, query string, onColumns func([]string) error, onRow func(row []string, values []any) error) error {
+	defer d.runAfterQuery()
+	query = d.applyQueryDefaults(query)
+	rewritten := d.rewrite(query)
+	if template, ok := d.chunkPlan(ctx, rewritten); ok {
+		if err := d.queryChunks(ctx, template, onColumns, onRow); err != nil {
+			return enrichQueryError(err, d.Fields, query)
+		}
+		return nil
+	}
+	var rows *sql.Rows
+	var err error
+	if ordered, ok := orderFilteredRows(rewritten); ok {
+		// The explicit order is only a speed-up; if it does not fit the
+		// query (e.g. an aggregate without GROUP BY), run the query as is.
+		rows, err = d.queryContext(ctx, ordered)
+	}
+	if rows == nil {
+		rows, err = d.queryContext(ctx, rewritten)
+	}
+	if err != nil {
+		return enrichQueryError(err, d.Fields, query)
+	}
+	return d.forwardRows(rows, true, onColumns, onRow)
+}
+
+func (d *Dataset) runAfterQuery() {
+	pending := d.afterQuery
+	d.afterQuery = nil
+	for _, f := range pending {
+		f()
+	}
 }
 
 func (d *Dataset) Count(ctx context.Context, query string) (int, error) {
 	query = d.applyQueryDefaults(query)
-	rewritten := strings.TrimSpace(rewriteQuery(query, d.Fields))
+	rewritten := strings.TrimSpace(d.rewrite(query))
 	rewritten = strings.TrimSuffix(rewritten, ";")
 	countSQL := fmt.Sprintf("select count(*) from (%s) as jtv_count", rewritten)
 
 	var total int
 	if err := d.db.QueryRowContext(ctx, countSQL).Scan(&total); err != nil {
-		return 0, enrichQueryError(err, d.Fields)
+		return 0, enrichQueryError(err, d.Fields, query)
 	}
 	return total, nil
 }
 
-func enrichQueryError(err error, fields []string) error {
+// rewrite turns a jtv query into the SQL DuckDB runs.
+func (d *Dataset) rewrite(query string) string {
+	sql := rewriteQuery(query, d.Fields)
+	sql = sqliteStringLiterals(sql, d.Fields)
+	sql = castPatternOperands(sql, d.Fields, d.textFields)
+	sql = quoteTextComparisons(sql, d.Fields, d.textFields)
+	sql = orderGroupsByKey(sql)
+	sql = orderTextNumerically(sql, d.textFields)
+	sql, missing := addKeyLookup(sql, d.keyTables)
+	if missing != "" {
+		d.requestKeyTable(missing)
+	}
+	return sql
+}
+
+func enrichQueryError(err error, fields []string, query string) error {
 	if err == nil {
 		return nil
 	}
-	message := err.Error()
-	const prefix = "no such column: "
-	index := strings.Index(message, prefix)
-	if index == -1 {
-		return err
+	field := ""
+	if match := missingColumnPattern.FindStringSubmatch(err.Error()); match != nil {
+		field = strings.Trim(match[1], "`\"'")
+	} else if match := missingTablePattern.FindStringSubmatch(err.Error()); match != nil {
+		// DuckDB reads an unknown dotted field such as user.nmae as
+		// table.column; recover the whole path from the query.
+		path := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(match[1]) + `\.[A-Za-z0-9_.]+`)
+		field = path.FindString(query)
 	}
-	field := strings.TrimSpace(message[index+len(prefix):])
-	if parts := strings.Fields(field); len(parts) > 0 {
-		field = parts[0]
-	}
-	field = strings.Trim(field, "`\"'")
 	field = strings.TrimSuffix(field, ";")
 	if field == "" {
 		return err
 	}
+	// DuckDB's binder message spans several lines with a caret diagram;
+	// the short form matches what jtv printed with SQLite.
 	if suggestion := closestField(field, fields); suggestion != "" {
-		return fmt.Errorf("%w; did you mean %s?", err, suggestion)
+		return fmt.Errorf("no such column: %s; did you mean %s?", field, suggestion)
 	}
-	return fmt.Errorf("%w; use ls or schema to list available fields", err)
+	return fmt.Errorf("no such column: %s; use ls or schema to list available fields", field)
 }
+
+// missingColumnPattern matches DuckDB's binder error for unknown columns.
+var missingColumnPattern = regexp.MustCompile(`Referenced column ("[^"]+"|\S+) not found`)
+
+// missingTablePattern matches DuckDB's binder error for unknown table names.
+var missingTablePattern = regexp.MustCompile(`Referenced table "([^"]+)" not found`)
 
 func closestField(target string, fields []string) string {
 	bestField := ""
@@ -290,66 +387,13 @@ func levenshtein(a, b string) int {
 	return prev[len(b)]
 }
 
-func (d *Dataset) load(rows []map[string]any) error {
-	columns := make([]string, 0, len(d.Fields))
-	for _, field := range d.Fields {
-		columns = append(columns, quoteIdent(field))
-	}
-	createSQL := fmt.Sprintf("create table input (%s)", strings.Join(columns, ", "))
-	if _, err := d.db.Exec(createSQL); err != nil {
-		return err
-	}
-
-	placeholders := make([]string, len(d.Fields))
-	for i := range placeholders {
-		placeholders[i] = "?"
-	}
-	insertSQL := fmt.Sprintf(
-		"insert into input (%s) values (%s)",
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "),
-	)
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	stmt, err := tx.Prepare(insertSQL)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	defer stmt.Close()
-
-	for _, row := range rows {
-		args := make([]any, len(d.Fields))
-		for i, field := range d.Fields {
-			args[i] = sqliteValue(row[field])
-		}
-		if _, err := stmt.Exec(args...); err != nil {
-			tx.Rollback()
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 func (d *Dataset) applyQueryDefaults(query string) string {
-	if shouldDistinctScalarQuery(query, d.Fields, d.ArrayFields) {
+	// A single row has no duplicates; skipping the grouping matters for
+	// --stream, which queries one row per line.
+	if d.RowCount > 1 && !d.streamBatch && shouldDistinctScalarQuery(query, d.Fields, d.ArrayFields) {
 		return addDistinctToSelect(query)
 	}
 	return query
-}
-
-func parseRows(data []byte, delimiter string) ([]any, error) {
-	rows, jsonErr := parseJSONRows(data)
-	if jsonErr == nil {
-		return rows, nil
-	}
-	rows, csvErr := parseCSVRows(data, delimiter)
-	if csvErr == nil {
-		return rows, nil
-	}
-	return nil, fmt.Errorf("%w; CSV fallback failed: %w", jsonErr, csvErr)
 }
 
 func parseJSONRows(data []byte) ([]any, error) {
@@ -388,56 +432,6 @@ func parseJSONRows(data []byte) ([]any, error) {
 	return rows, nil
 }
 
-func parseCSVRows(data []byte, delimiter string) ([]any, error) {
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) == 0 {
-		return nil, errors.New("empty input")
-	}
-
-	comma, err := csvDelimiter(trimmed, delimiter)
-	if err != nil {
-		return nil, err
-	}
-	reader := csv.NewReader(bytes.NewReader(trimmed))
-	reader.Comma = comma
-	reader.FieldsPerRecord = -1
-	records, err := reader.ReadAll()
-	if err != nil {
-		return nil, err
-	}
-	if len(records) < 2 {
-		return nil, errors.New("CSV input requires a header and at least one data row")
-	}
-
-	headers := make([]string, len(records[0]))
-	seen := map[string]int{}
-	for i, header := range records[0] {
-		header = strings.TrimSpace(header)
-		if header == "" {
-			header = fmt.Sprintf("column_%d", i+1)
-		}
-		seen[header]++
-		if seen[header] > 1 {
-			header = fmt.Sprintf("%s_%d", header, seen[header])
-		}
-		headers[i] = header
-	}
-
-	rows := make([]any, 0, len(records)-1)
-	for _, record := range records[1:] {
-		row := make(map[string]any, len(headers))
-		for i, header := range headers {
-			value := ""
-			if i < len(record) {
-				value = record[i]
-			}
-			row[header] = parseScalar(value)
-		}
-		rows = append(rows, row)
-	}
-	return rows, nil
-}
-
 func csvDelimiter(data []byte, delimiter string) (rune, error) {
 	delimiter = strings.TrimSpace(delimiter)
 	switch strings.ToLower(delimiter) {
@@ -459,7 +453,7 @@ func csvDelimiter(data []byte, delimiter string) (rune, error) {
 }
 
 func detectCSVDelimiter(data []byte) rune {
-	line := firstNonEmptyLine(string(data))
+	line := firstNonEmptyLine(data)
 	candidates := []rune{',', ';', '|', '\t'}
 	best := ','
 	bestCount := -1
@@ -473,11 +467,12 @@ func detectCSVDelimiter(data []byte) rune {
 	return best
 }
 
-func firstNonEmptyLine(data string) string {
-	for _, line := range strings.Split(strings.ReplaceAll(data, "\r\n", "\n"), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			return line
+func firstNonEmptyLine(data []byte) string {
+	for len(data) > 0 {
+		var line []byte
+		line, data = cutLine(data)
+		if line = bytes.TrimSpace(line); len(line) > 0 {
+			return string(line)
 		}
 	}
 	return ""
@@ -920,28 +915,20 @@ func replaceLastSeparator(value string, separator byte) string {
 func stringifyRow(values []any) []string {
 	row := make([]string, len(values))
 	for i, value := range values {
-		switch v := value.(type) {
-		case nil:
-			row[i] = ""
-		case []byte:
-			row[i] = string(v)
-		default:
-			row[i] = fmt.Sprint(v)
-		}
+		row[i] = displayString(value)
 	}
 	return row
-}
-
-func cloneValues(values []any) []any {
-	out := make([]any, len(values))
-	copy(out, values)
-	return out
 }
 
 func normalizeResultColumns(cols []string) []string {
 	out := make([]string, len(cols))
 	for i, col := range cols {
-		out[i] = strings.Trim(col, `"`)
+		col = strings.Trim(col, `"`)
+		col = strings.ReplaceAll(col, "count_star()", "count(*)") // DuckDB's name for count(*)
+		for name, udf := range jtvFunctions {
+			col = strings.ReplaceAll(col, udf+"(", name+"(")
+		}
+		out[i] = col
 	}
 	return out
 }
@@ -981,7 +968,41 @@ func shouldDistinctScalarQuery(query string, fields []string, arrayFields map[st
 	return true
 }
 
+// addDistinctToSelect removes duplicate rows from a plain field query.
+// DuckDB's DISTINCT does not keep row order, so when the query has no
+// ordering or grouping of its own, duplicates are folded with GROUP BY ALL
+// and rows are ordered by their first appearance in the input.
 func addDistinctToSelect(query string) string {
+	for _, keyword := range []string{"group", "order", "having", "union", "join", "distinct"} {
+		if hasTopLevelKeyword(query, keyword) {
+			return addPlainDistinct(query)
+		}
+	}
+	trimmed := strings.TrimRightFunc(query, unicode.IsSpace)
+	semicolon := ""
+	if strings.HasSuffix(trimmed, ";") {
+		trimmed = strings.TrimRightFunc(strings.TrimSuffix(trimmed, ";"), unicode.IsSpace)
+		semicolon = ";"
+	}
+	insertAt := len(trimmed)
+	for _, keyword := range []string{"limit", "offset"} {
+		if pos := topLevelKeywordPosition(trimmed, keyword); pos != -1 && pos < insertAt {
+			insertAt = pos
+		}
+	}
+	head := strings.TrimRightFunc(trimmed[:insertAt], unicode.IsSpace)
+	tail := trimmed[insertAt:]
+	if tail != "" {
+		tail = " " + tail
+	}
+	return head + " group by all order by min(" + rowOrderColumn + ")" + tail + semicolon
+}
+
+// rowOrderColumn is a hidden column of the input view holding each row's
+// position in the input.
+const rowOrderColumn = "jtv_rowid"
+
+func addPlainDistinct(query string) string {
 	trimmed := strings.TrimLeftFunc(query, unicode.IsSpace)
 	if len(trimmed) < len("select") || !strings.EqualFold(trimmed[:len("select")], "select") {
 		return query
@@ -1066,6 +1087,13 @@ func rewriteQuery(query string, fields []string) string {
 			i = next
 			continue
 		}
+		if isIdentStart(rune(ch)) && (i == 0 || !isIdentPart(rune(query[i-1]))) {
+			if replacement, end, ok := rewriteKeyword(query, i); ok {
+				b.WriteString(replacement)
+				i = end
+				continue
+			}
+		}
 		if isIdentStart(rune(ch)) {
 			if field, ok := matchField(query, i, sorted); ok {
 				b.WriteString(quoteIdent(field))
@@ -1077,6 +1105,30 @@ func rewriteQuery(query string, fields []string) string {
 		i++
 	}
 	return b.String()
+}
+
+// rewriteKeyword maps jtv function names to their registered UDFs, e.g.
+// int(x) to jtv_int(x), and LIKE to ILIKE so matching stays
+// case-insensitive as it was with SQLite.
+func rewriteKeyword(query string, start int) (string, int, bool) {
+	end := start
+	for end < len(query) && isIdentPart(rune(query[end])) {
+		end++
+	}
+	word := strings.ToLower(query[start:end])
+	if word == "like" {
+		return "ilike", end, true
+	}
+	if udf, ok := jtvFunctions[word]; ok {
+		next := end
+		for next < len(query) && (query[next] == ' ' || query[next] == '\t') {
+			next++
+		}
+		if next < len(query) && query[next] == '(' {
+			return udf, end, true
+		}
+	}
+	return "", 0, false
 }
 
 func expandImplicitInput(query string) string {
@@ -1143,6 +1195,10 @@ func hasTopLevelLimit(query string) bool {
 }
 
 func hasTopLevelKeyword(query, keyword string) bool {
+	return topLevelKeywordPosition(query, keyword) != -1
+}
+
+func topLevelKeywordPosition(query, keyword string) int {
 	for i := 0; i < len(query); {
 		ch := query[i]
 		if ch == '\'' || ch == '"' || ch == '`' {
@@ -1155,14 +1211,14 @@ func hasTopLevelKeyword(query, keyword string) bool {
 				end++
 			}
 			if strings.EqualFold(query[i:end], keyword) {
-				return true
+				return i
 			}
 			i = end
 			continue
 		}
 		i++
 	}
-	return false
+	return -1
 }
 
 func findImplicitFromInsertPosition(query string) int {

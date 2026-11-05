@@ -4,23 +4,28 @@
 streaming output.
 
 It accepts JSON arrays, single JSON values/objects, NDJSON/JSON Lines, and CSV.
-Data is loaded into an in-memory SQLite table named `input`. Nested JSON fields
-are flattened into dot-path columns, so fields can be queried as `user.name`
-without quoting in most queries.
+Data is loaded into an in-memory [DuckDB](https://duckdb.org) table named
+`input`, so queries run on a parallel, columnar engine: grouping 10 million CSV
+rows takes a fraction of a second. Nested JSON fields are flattened into
+dot-path columns, so fields can be queried as `user.name` without quoting in
+most queries.
 
 The table name is optional. `select *` automatically means
 `select * from input`, and the internal `raw` column is hidden from `*`.
 
 ## Install
 
+DuckDB is linked through cgo, so a C/C++ toolchain is required (for example
+`apt install build-essential`). jtv builds on Linux and macOS.
+
 ```bash
-go install github.com/srcodee/jtv/cmd/jtv@latest
+CGO_ENABLED=1 go install github.com/srcodee/jtv/cmd/jtv@latest
 ```
 
 ## Build
 
 ```bash
-go build -buildvcs=false -o jtv ./cmd/jtv
+CGO_ENABLED=1 go build -buildvcs=false -o jtv ./cmd/jtv
 ```
 
 ## Usage
@@ -82,6 +87,9 @@ Without `-q`, `jtv` starts an interactive prompt with SQL autocomplete.
 -config FILE
             read defaults from FILE instead of the user config path
 --no-config ignore config file
+--no-cache  do not read or write the cache for large CSV files
+--csv-header auto|yes|no
+            whether a CSV starts with a header row (default: detect)
 ```
 
 If no output flag is set, results are printed as an ASCII table. With `-o`, the
@@ -105,7 +113,7 @@ JSON input can be an array, object, scalar, or NDJSON stream:
 ]
 ```
 
-CSV input requires a header row and at least one data row:
+CSV input usually starts with a header row:
 
 ```csv
 id,status,user.name,user.active
@@ -113,9 +121,112 @@ id,status,user.name,user.active
 2,fail,Budi,0
 ```
 
+Files without a header row are detected: when the first row looks like the
+data below it (numbers above numbers, not a name above numbers), it is kept
+as data and the columns are named `col1`, `col2`, ... Files of text columns
+only cannot be told apart and are read with a header. Use `--csv-header yes`
+or `--csv-header no` to decide yourself.
+
+Give columns better names with `rename`, in interactive mode or with `-q`.
+Names are saved for the file and used every time it is opened, also by
+`jtv serve`; renaming is instant and does not rebuild any cache:
+
+```bash
+jtv -f crm.csv -q "rename col1 phone"
+jtv -f crm.csv -q "rename col2 code"
+jtv -f crm.csv -q "select * where phone = 620000000040"
+jtv -f crm.csv -q "rename"        # list renamed fields
+jtv -f crm.csv -q "rename reset"  # back to col1, col2
+```
+
+Saved names live in the user config directory (`~/.config/jtv/columns` on
+Linux).
+
 CSV headers are trimmed. Empty headers become `column_N`, duplicate headers get
-a numeric suffix, and scalar CSV values are parsed as booleans, integers, or
-floats when possible.
+a numeric suffix, and values are trimmed.
+
+Each CSV column gets one type: integer when every value is an integer, number
+when every value is numeric, boolean (stored as `1`/`0`) when every value is
+`true`/`false`, and text otherwise. Empty cells are `NULL`; `field = ''` on a
+numeric column is read as `field is null`. A column that holds mostly numbers
+and a few words, such as phone numbers with test entries, is text, but still
+compares with numbers the way you would expect:
+
+```sql
+select * where phone = 620000000040;        -- matches the text '620000000040'
+select count(*) where phone > 620009000000; -- compares numerically, skipping words
+select phone order by phone desc;           -- numbers in numeric order, then words
+```
+
+### Large CSV files
+
+Large local CSV files (8MB and up) are read by DuckDB directly and cached as a
+DuckDB database file in the user cache directory (`~/.cache/jtv` on Linux).
+The first run answers from memory while a background process writes the
+cache; later runs open the cache instead of parsing the file again. A file of
+10 million rows loads in about 1.5 seconds the first time and about 0.1
+seconds afterwards. The cache is rebuilt automatically when the file changes.
+Use `--no-cache` (or `JTV_NO_CACHE=1`) to skip it, and `JTV_CACHE_DIR` to move
+it.
+
+The cache can also keep a sorted copy of each mostly-unique column, such as
+phone numbers or ids, so lookups like `phone = 620000000040`, `phone in (...)` and
+`phone like '62000%'` read only the blocks holding the matches: finding one
+number among 100 million rows takes about 0.13 seconds. The background builder
+works on disk with a 1GB memory limit, so it can run next to an interactive
+session holding the data.
+
+Files larger than the free memory still load: when a file would not fit in
+memory (a load needs about 2.5 times the file size), jtv loads it into a
+DuckDB database on disk with a memory limit of half the free memory, and
+when caching is on, that load is the cache itself. A 100 million row file
+with only 2GB free took 29 seconds and 1.2GB the first time, instead of 9
+seconds and 4.2GB in memory; later runs use the cache as usual.
+
+Results of `-q` are written as they are produced, so exporting all rows of a
+large file needs about 1GB of memory rather than memory for the whole result:
+
+```bash
+jtv -f big.csv -q "select * where status = 'ok'" -o ok.csv
+```
+
+CSV files written with `-o` are produced by DuckDB itself when the result has
+only integer, boolean and text columns, about ten times faster (10 million
+rows in under a second). The file is byte for byte what jtv's own writer
+produces; results with decimals, dates or text starting with a space use
+jtv's writer.
+
+### Keeping a file loaded
+
+Each run starts a process and opens the data, which costs about 0.1 seconds
+even when the query itself takes a few milliseconds. When you run many queries
+against the same file, keep it loaded:
+
+```bash
+jtv serve -f big.csv            # loads once, then waits in the background
+jtv -f big.csv -q "select ..."  # answered by the server in ~20-40ms
+jtv stop -f big.csv
+```
+
+`jtv -f FILE -q ...` uses a running server for FILE automatically and runs
+locally otherwise, so scripts need no change. The server stops after 30
+minutes without queries (`--idle 2h`, or `--idle 0` to keep it), and it
+stops by itself when FILE changes so stale data is never served.
+
+After the cache, the same background process builds the lookup tables for
+mostly-unique columns. Until they are ready a lookup scans the column (about
+1-3 seconds on 100 million rows); on a new 100 million row file they are ready
+about a minute after the first run, with nobody having to search first. A run
+started while the cache is being built waits for it instead of loading the
+file a second time. The builders work in memory when the system has room for
+it and on disk within 1GB otherwise, for example next to an open interactive
+session holding the data.
+
+Measured on a 100 million row, 1.85GB pipe-delimited file (WSL2, 12 cores,
+6.8GB RAM): first load 9 seconds; with the cache, `count(*)` 0.13 seconds,
+`group by` 0.4 seconds, one-number lookup 0.13 seconds (0.04 seconds through
+`jtv serve`); exporting 41 million filtered rows to CSV 33 seconds using under
+1GB.
 
 CSV delimiters are auto-detected from comma, semicolon, pipe (`|`), and tab.
 Use `--delimiter` to force a delimiter:
@@ -196,6 +307,14 @@ Stream mode requires `-q`. It does not support `-o`; redirect stdout instead.
 Invalid lines or query errors are reported to stderr and the stream continues.
 With `--json`, stream output is JSON Lines. With `--csv`, the header is written
 once.
+
+Lines that are already waiting, such as a whole log file or a burst from
+`tail -f`, are answered in batches when the result is guaranteed to be the
+same as line by line: consecutive lines with the same fields and types, and
+a query that only selects and filters rows. 20,000 log lines then take about
+half a second instead of 20-45 seconds. Queries that aggregate, sort, limit
+or de-duplicate per line, lines with arrays, and Markdown output still run
+line by line, and a line arriving on its own is answered right away.
 
 ## Config
 
@@ -318,7 +437,7 @@ date(value)    normalize a date/time to YYYY-MM-DD
 year(value)    extract the year from a date/time
 month(value)   extract the month number from a date/time
 regexp_like(value, pattern)
-              return 1 when value matches a regular expression
+              return true when value matches a regular expression
 ```
 
 Shortcut query commands are available in `-q` and interactive mode:
@@ -329,6 +448,13 @@ head [N]       alias for preview [N]
 uniq FIELD     distinct values
 count [FIELD]  count rows, or count rows by FIELD
 ```
+
+Queries run on DuckDB with a few SQLite-compatible adjustments, so queries
+written for earlier versions keep working: `like` is case-insensitive,
+double-quoted words that are not field names are strings (`like "62000%"`),
+groups without `order by` come back sorted by key, and rows without
+`order by` keep file order. Two differences remain: `/` divides exactly
+(`5/2` is `2.5`), and `typeof()` returns DuckDB type names such as `BIGINT`.
 
 If a query references a field that does not exist, `jtv` suggests the nearest
 detected field when it can:

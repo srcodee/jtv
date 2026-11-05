@@ -20,10 +20,9 @@ import (
 
 	prompt "github.com/c-bata/go-prompt"
 	"golang.org/x/sys/unix"
-	_ "modernc.org/sqlite"
 )
 
-const version = "0.1.5"
+const version = "0.2.0"
 
 type options struct {
 	file          string
@@ -250,13 +249,28 @@ func (r *repeatedStrings) Set(value string) error {
 }
 
 func main() {
+	if isCacheBuilderProcess() {
+		os.Exit(runCacheBuilder())
+	}
+	if isServeProcess() {
+		os.Exit(runServeProcess())
+	}
+	// The process ends right after run; freeing a large in-memory database
+	// first would only delay the exit (about 80ms for 10 million rows).
+	exitWithoutClosingDatasets = true
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
+// exitWithoutClosingDatasets is set by main, whose process exits after run.
+var exitWithoutClosingDatasets bool
+
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) > 0 && (args[0] == "serve" || args[0] == "stop") {
+		return runServeCommand(args[0], args[1:], stdout, stderr)
+	}
 	opts, err := defaultOptions(args)
 	if err != nil {
 		return err
@@ -280,6 +294,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs.BoolVar(&opts.debugRequest, "debug-request", false, "print safe HTTP request/response debug info")
 	fs.BoolVar(&opts.showRequest, "show-request", false, "print parsed HTTP request without fetching it")
 	fs.BoolVar(&opts.noConfig, "no-config", opts.noConfig, "ignore config file")
+	fs.BoolVar(&csvCacheDisabled, "no-cache", false, "do not read or write the cache for large CSV files")
+	fs.StringVar(&csvHeaderMode, "csv-header", "auto", "CSV header row: auto (detect), yes, or no (columns become col1, col2, ...)")
 	fs.BoolVar(&opts.version, "version", false, "print version and exit")
 	fs.Usage = func() {
 		printCLIUsage(stderr, fs)
@@ -291,6 +307,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 	resolveOutputFlagOverrides(fs, &opts)
+	if err := validHeaderMode(csvHeaderMode); err != nil {
+		return err
+	}
 
 	if opts.version {
 		printVersion(stdout)
@@ -299,6 +318,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 
 	if opts.stream {
 		return runStream(fs.Args(), stdin, stdout, opts)
+	}
+	if len(fs.Args()) == 0 {
+		if handled, err := tryServer(opts, stdout); handled {
+			return err
+		}
 	}
 
 	loaded, err := readInput(fs.Args(), stdin, opts)
@@ -328,16 +352,31 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	ds, err := NewDatasetWithDelimiter(data, source, opts.delimiter)
+	path := loaded.path
+	if opts.root != "" {
+		path = ""
+	}
+	ds, err := NewDatasetFromInput(data, path, source, opts.delimiter)
 	if err != nil {
 		return err
 	}
-	defer ds.Close()
+	ds.useSavedColumnNames(path)
+	defer func() {
+		// A temporary on-disk database must be deleted even at exit.
+		if !exitWithoutClosingDatasets || ds.tempDB != "" {
+			ds.Close()
+		}
+	}()
 
 	if opts.query == "" {
 		return runInteractive(ds, stdin, stdout, opts.pageSize)
 	}
+	return executeQuery(ds, opts, stdout)
+}
 
+// executeQuery runs a -q query, shortcut command or aggregate shortcut and
+// writes its result. jtv serve answers clients through the same function.
+func executeQuery(ds *Dataset, opts options, stdout io.Writer) error {
 	if handled, err := runQueryCommand(ds, stdout, opts.query); handled {
 		return err
 	}
@@ -347,25 +386,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		opts.query = query
 	}
-
-	result, err := ds.Query(context.Background(), opts.query)
-	if err != nil {
-		return err
-	}
-	if opts.output != "" {
-		return writeResultFile(opts.output, result)
-	}
-	if opts.json {
-		return writeJSON(stdout, result)
-	}
-	if opts.csv {
-		return writeCSV(stdout, result)
-	}
-	if opts.md {
-		return writeMarkdown(stdout, result)
-	}
-	printTable(stdout, result)
-	return nil
+	return streamQueryResult(ds, opts, stdout)
 }
 
 func runQueryCommand(ds *Dataset, out io.Writer, query string) (bool, error) {
@@ -374,6 +395,8 @@ func runQueryCommand(ds *Dataset, out io.Writer, query string) (bool, error) {
 	case "ls", "schema", "fields", ".ls", ".schema", ".fields":
 		printSchema(out, ds.Fields, ds.FieldLabels, ds.FieldTypes, ds.FieldSamples, arg)
 		return true, nil
+	case "rename", ".rename":
+		return true, ds.renameCommand(arg, out)
 	case "preview", "head", ".preview", ".head":
 		limit := "10"
 		if arg != "" {
@@ -563,6 +586,8 @@ func printCLIUsage(out io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(out, "  jtv -f FILE")
 	fmt.Fprintln(out, "  jtv --stream -q SQL")
 	fmt.Fprintln(out, "  jtv --version")
+	fmt.Fprintln(out, "  jtv serve -f FILE [--idle 30m]   keep FILE loaded; later -q runs answer from it")
+	fmt.Fprintln(out, "  jtv stop -f FILE")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Flags:")
 	fs.PrintDefaults()
@@ -607,8 +632,10 @@ func printCLIUsage(out io.Writer, fs *flag.FlagSet) {
 }
 
 type loadedInput struct {
-	data     []byte
-	source   string
+	data   []byte
+	source string
+	// path is the local file data was read from, if any.
+	path     string
 	request  *requestInput
 	response *requestResponseInfo
 }
@@ -637,14 +664,65 @@ func readInput(args []string, stdin io.Reader, opts options) (loadedInput, error
 	if req, ok := directURLRequest(opts.file); ok {
 		return loadRequestInput(req, opts.file, opts)
 	}
+	if loaded, ok, err := peekDelimitedFile(opts.file, opts); ok || err != nil {
+		return loaded, err
+	}
 	data, err := os.ReadFile(opts.file)
 	if err != nil {
 		return loadedInput{}, err
 	}
-	return loadInputData(data, opts.file, opts)
+	loaded, err := loadInputData(data, opts.file, opts)
+	if err == nil && loaded.request == nil {
+		loaded.path = opts.file
+	}
+	return loaded, err
+}
+
+// peekPrefixSize is how much of a local file jtv reads to recognize it as
+// delimited text. DuckDB then reads the whole file itself.
+const peekPrefixSize = 1 << 20
+
+// peekDelimitedFile recognizes large local CSV-like files from their start
+// so they are not read into memory twice. It reports ok=false when the file
+// may be JSON, a request file, or anything that needs the full contents.
+func peekDelimitedFile(path string, opts options) (loadedInput, bool, error) {
+	if opts.root != "" {
+		return loadedInput{}, false, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return loadedInput{}, false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= peekPrefixSize {
+		return loadedInput{}, false, nil
+	}
+	prefix := make([]byte, peekPrefixSize)
+	n, err := io.ReadFull(file, prefix)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return loadedInput{}, false, err
+	}
+	prefix = prefix[:n]
+	if len(prefix) == 0 || isSpaceByte(prefix[0]) {
+		return loadedInput{}, false, nil
+	}
+	if mayBeRequestInput(prefix) {
+		if _, isRequest, _ := parseRequestInput(string(prefix)); isRequest {
+			return loadedInput{}, false, nil
+		}
+	}
+	// JSON and NDJSON start with a line that is valid JSON on its own.
+	if first, _ := cutLine(prefix); json.Valid(bytes.TrimSpace(first)) {
+		return loadedInput{}, false, nil
+	}
+	return loadedInput{data: prefix, source: path, path: path}, true, nil
 }
 
 func loadInputData(data []byte, source string, opts options) (loadedInput, error) {
+	if !mayBeRequestInput(data) {
+		return loadedInput{data: data, source: source}, nil
+	}
 	req, ok, err := parseRequestInput(string(data))
 	if err != nil {
 		return loadedInput{}, err
@@ -653,6 +731,20 @@ func loadInputData(data []byte, source string, opts options) (loadedInput, error
 		return loadRequestInput(req, source, opts)
 	}
 	return loadedInput{data: data, source: source}, nil
+}
+
+// mayBeRequestInput rejects data that cannot be a curl, PowerShell or raw HTTP
+// request, so large data files skip copying and lowercasing the whole input.
+func mayBeRequestInput(data []byte) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return false
+	}
+	switch c := trimmed[0]; {
+	case c == '{' || c == '[' || (c >= '0' && c <= '9'):
+		return false
+	}
+	return true
 }
 
 func loadRequestInput(req requestInput, source string, opts options) (loadedInput, error) {
@@ -799,32 +891,15 @@ func runStream(args []string, stdin io.Reader, stdout io.Writer, opts options) e
 	}
 	defer input.Close()
 
-	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 1024*64), 1024*1024*16)
-	writer := newStreamWriter(stdout, opts)
-	lineNumber := 0
-	for scanner.Scan() {
-		lineNumber++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		ds, err := NewDatasetWithDelimiter([]byte(line), fmt.Sprintf("stream:%d", lineNumber), opts.delimiter)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "stream line %d: %v\n", lineNumber, err)
-			continue
-		}
-		result, err := ds.Query(context.Background(), query)
-		ds.Close()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "stream line %d: %v\n", lineNumber, err)
-			continue
-		}
-		if err := writer.Write(result); err != nil {
-			return err
-		}
+	// One database serves every line; each line replaces its rows.
+	session, err := newStreamSession()
+	if err != nil {
+		return err
 	}
-	if err := scanner.Err(); err != nil {
+	defer session.Close()
+
+	writer := newStreamWriter(stdout, opts)
+	if err := runStreamBatched(input, session, writer, opts, query); err != nil {
 		return err
 	}
 	return writer.Close()
@@ -955,6 +1030,12 @@ func runInteractive(ds *Dataset, stdin io.Reader, out io.Writer, pageSize int) e
 			continue
 		case command == ".help" || command == "help":
 			printHelp(out)
+			continue
+		case command == "rename" || command == ".rename":
+			if err := ds.renameCommand(arg, out); err != nil {
+				fmt.Fprintln(out, "error:", err)
+			}
+			completer = makeCompleter(ds.Fields)
 			continue
 		case command == ".schema" || command == ".ls" || command == ".fields" || command == "schema" || command == "ls" || command == "fields":
 			printSchema(out, ds.Fields, ds.FieldLabels, ds.FieldTypes, ds.FieldSamples, arg)
@@ -1174,6 +1255,20 @@ func applyInteractiveDefaults(query string) string {
 func printWelcome(out io.Writer, ds *Dataset) {
 	fmt.Fprintf(out, "jtv %s\n", ds.Source)
 	fmt.Fprintf(out, "%d rows, %d fields\n", ds.RowCount, visibleFieldCount(ds.Fields))
+	if ds.headerless {
+		var generated []string
+		for _, field := range ds.base.fieldsOr(ds.Fields) {
+			if field != "raw" {
+				generated = append(generated, field)
+			}
+		}
+		fmt.Fprintf(out, "no header row found: the first row is data and columns are named %s\n", strings.Join(generated, ", "))
+		if len(ds.columnNames) == 0 && len(generated) > 0 {
+			fmt.Fprintf(out, "give them names with: rename %s NEW_NAME (saved for this file)\n", generated[0])
+		} else if len(ds.columnNames) > 0 {
+			fmt.Fprintln(out, "using your saved names; see them with: rename")
+		}
+	}
 	fmt.Fprintln(out, "type help for commands, exit to quit")
 	fmt.Fprintln(out, "")
 }
@@ -1310,6 +1405,8 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  head [N]            alias for preview")
 	fmt.Fprintln(out, "  fields              alias for schema")
 	fmt.Fprintln(out, "  uniq FIELD          distinct values")
+	fmt.Fprintln(out, "  rename FIELD NAME   show FIELD as NAME; saved for this file")
+	fmt.Fprintln(out, "  rename / rename reset  list / undo renamed fields")
 	fmt.Fprintln(out, "  count [FIELD]       count rows or count by field")
 	fmt.Fprintln(out, "  next, n             show next page")
 	fmt.Fprintln(out, "  prev, p             show previous page")

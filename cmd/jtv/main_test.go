@@ -226,7 +226,7 @@ func TestRunVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v\nstderr: %s", err, stderr.String())
 	}
-	if stdout.String() != "jtv 0.1.5\n" {
+	if stdout.String() != "jtv 0.2.0\n" {
 		t.Fatalf("stdout = %q, want version", stdout.String())
 	}
 }
@@ -241,7 +241,7 @@ func TestRunHelp(t *testing.T) {
 	}
 	help := stderr.String()
 	for _, want := range []string{
-		"jtv 0.1.5",
+		"jtv 0.2.0",
 		"Usage:",
 		"jtv --version",
 		"Input:",
